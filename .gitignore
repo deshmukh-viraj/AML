@@ -89,3 +89,4 @@ target/
 .mypy_cache/
 atlas
 .env
+notebooks/aml_features/
