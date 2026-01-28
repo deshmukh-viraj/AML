@@ -18,5 +18,9 @@ def compute_derived_features(df: pl.LazyFrame) -> pl.LazyFrame:
         #volume concentration
         (pl.col('total_amount_paid_28d') / (pl.col('txn_count_28d') + 1))
             .alias('avg_txn_size_28d'),
+
+        #volatility (coeff of variance)
+        # high volatility indicate erratic laundering behavior
+        (pl.col('std_amount_paid_28d') / (pl.col('mean_amount_paid_28d') + 1e-6)).alias('amount_cv_28d')
     ])
 

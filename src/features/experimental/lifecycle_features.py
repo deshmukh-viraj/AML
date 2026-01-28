@@ -8,7 +8,7 @@ def add_account_lifecycle_features(df: pl.LazyFrame) -> pl.LazyFrame:
 
     #use window function instead of separate group_by + join
     df = df.with_columns([
-        pl.col('Timestamp').min().over('Account').alias('account_first_txn')
+        pl.col('Timestamp').min().over('Account_HASHED').alias('account_first_txn')
     ])
 
     df = df.with_columns([
@@ -20,11 +20,11 @@ def add_account_lifecycle_features(df: pl.LazyFrame) -> pl.LazyFrame:
         # Transaction sequence number for this account
         pl.col('Timestamp')
             .rank(method='ordinal')
-            .over('Account')
+            .over('Account_HASHED')
             .alias('txn_rank_in_account_history'),
 
         # Days since previous transaction
-        ((pl.col('Timestamp') - pl.col('Timestamp').shift(1).over('Account'))
+        ((pl.col('Timestamp') - pl.col('Timestamp').shift(1).over('Account_HASHED'))
          .dt.total_seconds() / 86400)
         .fill_null(0)
         .alias('days_since_last_txn'),
