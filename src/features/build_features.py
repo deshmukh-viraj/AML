@@ -26,16 +26,16 @@ import polars as pl
 import pandas as pd
 
 # Import feature modules
-from src.features.experimental.rolling_features import (
+from src.features.experimental.rolling_features_v2 import (
     compute_rolling_features_batch1,
     compute_rolling_features_batch2,
     compute_rolling_features_batch3,
 )
 from src.features.experimental.ratio_features import compute_advanced_features
-from src.features.experimental.advanced_rolling_features import (
+from src.features.experimental.advanced_rolling_features_v2 import (
     add_advanced_rolling_features
 )
-from src.features.experimental.counterparty_entropy_features import (
+from src.features.experimental.counterparty_entropy_features_v2 import (
     add_counterparty_entropy_features
 )
 from src.features.experimental.isolation_forest_anomaly import (
@@ -178,17 +178,17 @@ def build_training_features(
     val_features = processed_splits['val']
     test_features = processed_splits['test']
     
-    # Add anomaly scores (fitted on train, applied to all)
-    logger.info("\n" + "="*70)
-    logger.info("Adding Unsupervised Anomaly Scores (Isolation Forest)")
-    logger.info("="*70)
+    # Add anomaly scores (fitted on train, applied to all) - DISABLED FOR NOW
+    # logger.info("\n" + "="*70)
+    # logger.info("Adding Unsupervised Anomaly Scores (Isolation Forest)")
+    # logger.info("="*70)
     
-    train_features, val_features, test_features = add_isolation_forest_scores(
-        train_features,
-        val_features,
-        test_features,
-        contamination=0.10
-    )
+    # train_features, val_features, test_features = add_isolation_forest_scores(
+    #     train_features,
+    #     val_features,
+    #     test_features,
+    #     contamination=0.10
+    # )
     
     return train_features, val_features, test_features
 
@@ -222,8 +222,8 @@ def validate_features(df: pl.DataFrame) -> Dict:
         if missing > 0:
             logger.warning(f"  ⚠ {col}: {missing} missing values")
     
-    # Check for infinite values
-    numeric_cols = df.select(pl.col('*').try_cast(pl.Float64)).columns
+    # Check numeric columns
+    numeric_cols = df.select(pl.col(pl.NUMERIC_DTYPES)).columns
     
     # Basic statistics
     logger.info(f"\nFeature Statistics:")
@@ -289,11 +289,12 @@ def build_all_features(
     logger.info(f"\nLoading transactions from {transactions_path}")
     trans = pl.scan_csv(transactions_path, try_parse_dates=True)
     
-    if sample_fraction:
-        trans = trans.sample(fraction=sample_fraction, seed=42)
-    
     logger.info(f"Loading accounts from {accounts_path}")
     accounts = pl.read_csv(accounts_path)
+    
+    if sample_fraction:
+        logger.info(f"Sampling {sample_fraction*100}% of transactions...")
+        trans = trans.collect().sample(fraction=sample_fraction, seed=42).lazy()
     
     # Hash PII
     logger.info("Hashing PII columns...")

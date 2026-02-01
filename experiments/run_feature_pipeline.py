@@ -16,7 +16,7 @@ import gc
 from src.features.experimental.time_features import add_cyclical_time_features
 from src.features.experimental.benford_features import add_benford_features
 from src.features.experimental.lifecycle_features import add_account_lifecycle_features
-from src.features.experimental.rolling_features import (
+from src.features.experimental.rolling_features_v2 import (
     compute_rolling_features_batch1,
     compute_rolling_features_batch2,
     compute_rolling_features_batch3,
@@ -24,6 +24,12 @@ from src.features.experimental.rolling_features import (
 from src.features.experimental.ratio_features import compute_advanced_features
 from src.features.experimental.derived_features import compute_derived_features
 from src.features.experimental.toxic_corridors import apply_toxic_corridor_features
+from src.features.experimental.network_features import (
+    compute_bank_centrality_features,
+    compute_account_network_features,
+    compute_corridor_risk_score
+)
+from src.features.experimental.anomaly_features import compute_all_anomaly_scores
 from src.utils.hashing import hash_pii_column
 from src.config import DATA_DIR
 from src.features.experimental.precompute_entity_stats import precompute_entity_stats
@@ -341,6 +347,30 @@ class AMLFeatureEngineer:
           logger.info("  Phase 6: Toxic corridor features...")
           df = apply_toxic_corridor_features(df, toxic_corridors)
           self.tracker.end_phase()
+      
+      gc.collect()
+
+      #NETWORK GRAPH FEATURES
+      self.tracker.start_phase(f"{split_name} - Network Features")
+      logger.info("  Phase 7: Bank centrality and network features...")
+      try:
+          df = compute_bank_centrality_features(df)
+          df = compute_account_network_features(df)
+          df = compute_corridor_risk_score(df)
+      except Exception as e:
+          logging.warning(f"Network features failed (non-critical): {e}")
+      self.tracker.end_phase()
+
+      gc.collect()
+
+      #ANOMALY DETECTION FEATURES
+      self.tracker.start_phase(f"{split_name} - Anomaly Detection")
+      logger.info("  Phase 8: Unsupervised anomaly detection scores...")
+      try:
+          df = compute_all_anomaly_scores(df)
+      except Exception as e:
+          logging.warning(f"Anomaly detection failed (non-critical): {e}")
+      self.tracker.end_phase()
       
       gc.collect()
       # FINAL OUTPUT
