@@ -47,7 +47,8 @@ class AMLXGBoostModel:
                  colsample_bytree: float = 0.8,
                  objective: str = 'binary:logistic',
                  eval_metric: str = 'aucpr',
-                 seed: int = 42):
+                 seed: int = 42,
+                 **kwargs):  # Accept additional parameters for model loading
         """Initialize XGBoost parameters."""
         
         self.params = {
@@ -58,9 +59,9 @@ class AMLXGBoostModel:
             'objective': objective,
             'eval_metric': eval_metric,
             'seed': seed,
-            'tree_method': 'hist',
-            'device': 'cuda',  # Use GPU if available
-            'verbosity': 1,
+            'tree_method': kwargs.get('tree_method', 'hist'),
+            'device': kwargs.get('device', 'cuda'),  # Use GPU if available
+            'verbosity': kwargs.get('verbosity', 1),
         }
         
         self.model: Optional[xgb.Booster] = None
@@ -299,6 +300,14 @@ class AMLXGBoostModel:
         # Compute metrics
         tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
         
+        # Compute PR-AUC with proper sorting
+        prec, rec, _ = precision_recall_curve(y_true, probas)
+        # Sort by recall (ascending) to ensure monotonic increasing order
+        sorted_indices = np.argsort(rec)
+        rec_sorted = rec[sorted_indices]
+        prec_sorted = prec[sorted_indices]
+        pr_auc_val = auc(rec_sorted, prec_sorted)
+        
         metrics = {
             'threshold': threshold,
             'accuracy': (tp + tn) / (tp + tn + fp + fn),
@@ -306,7 +315,7 @@ class AMLXGBoostModel:
             'recall': recall_score(y_true, y_pred, zero_division=0),
             'f1': f1_score(y_true, y_pred, zero_division=0),
             'roc_auc': roc_auc_score(y_true, probas),
-            'pr_auc': auc(*precision_recall_curve(y_true, probas)[:2]),
+            'pr_auc': pr_auc_val,
             'mcc': matthews_corrcoef(y_true, y_pred),
             'cohen_kappa': cohen_kappa_score(y_true, y_pred),
             'tp': int(tp),
