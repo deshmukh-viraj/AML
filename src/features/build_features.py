@@ -23,17 +23,14 @@ import logging
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 import polars as pl
-import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
 
 # Import feature modules
 from src.features.experimental.base_features import add_base_features
 from src.features.experimental.precompute_entity_stats import precompute_entity_stats
 
-from src.features.experimental.rolling_features_v2 import (
-    compute_rolling_features_batch1,
-    compute_rolling_features_batch2,
-    compute_rolling_features_batch3,
-)
+from src.features.experimental.rolling_features_v2 import compute_rolling_features
 from src.features.experimental.ratio_features import compute_advanced_features
 from src.features.experimental.derived_features import compute_derived_features
 from src.features.experimental.advanced_rolling_features_v2 import (
@@ -62,8 +59,10 @@ def build_training_features(
     train_df: pl.LazyFrame,
     val_df: pl.LazyFrame,
     test_df: pl.LazyFrame,
-    accounts: Optional[pl.DataFrame] = None
+    accounts: Optional[pl.DataFrame] = None,
+    output_dir: Path = Path('./aml_features')
 ) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+
     """
     Build all features for training, validation, and test sets.
     Processes splits sequentially to manage memory.
@@ -105,9 +104,9 @@ def build_training_features(
         
         # 0. Optimize dtypes
         df = optimize_dtypes(df)
-
+        
         # 1. Sort for rolling features
-        logger.info("  Step 1: Sorting...")
+        logger.info("  Step 1: Sorting(maintained through pipeline)...")
         df = df.sort(['Account_HASHED', 'Timestamp'])
         
         # 2. Base features
@@ -122,43 +121,67 @@ def build_training_features(
             assert 'Account_HASHED' in df.columns or isinstance(df, pl.LazyFrame), "Expected Account_HASHED in transaction df"
             if entity_stats is not None:
                 assert 'Account Number_HASHED' in entity_stats.columns, "entity_stats must contain Account Number_HASHED for join"
-                
+        
+        # Checkpoint A: 
+        logger.info("  CHECKPOINT A: Materializing rolling features...")
+        checkpoint_a_path = output_dir / f'{split_name}_checkpoint_base.parquet'
+        df.sink_parquet(checkpoint_a_path, compression='zstd', maintain_order=False)
+
+        import gc
+        gc.collect()
+
+        df = pl.scan_parquet(checkpoint_a_path).sort(['Account_HASHED', 'Timestamp'])
+        logger.info(f"  Checkpoint A written to {checkpoint_a_path}")
+
         # 3. Standard rolling features (from original pipeline)
         logger.info("  Step 3: Standard rolling features...")
        
-        df = compute_rolling_features_batch1(df)
-        df = compute_rolling_features_batch2(df)
-        df = compute_rolling_features_batch3(df)
+        df = compute_rolling_features(df)
         
+
+        logger.info("  CHECKPOINT B: Materilizing rolling features...")
+        checkpoint_b_path = output_dir / f'{split_name}_checkpoint_rolling.parquet'
+        df.sink_parquet(checkpoint_b_path, compression='zstd', maintain_order=False)
+
+        import gc
+        gc.collect()
+
+        df = pl.scan_parquet(checkpoint_b_path).sort(['Account_HASHED', 'Timestamp'])
+        logger.info(f"  Checkpoint writeen B to {checkpoint_b_path}")
+
         # 4. Derived/ratio features
         logger.info("  Step 4: Ratio and Derived features...")
         df = compute_advanced_features(df)
         df = compute_derived_features(df)
-        
+
+        logger.info("  CHECKPOINT C: Materializing ratio features...")
+        checkpoint_c_path = output_dir / f'{split_name}_checkpoint_ratio.parquet'
+        df.sink_parquet(checkpoint_c_path, compression='zstd', maintain_order=False)
+
+        import gc
+        gc.collect()
+        df = pl.scan_parquet(checkpoint_c_path).sort(['Account_HASHED', 'Timestamp'])
+        logger.info(f"  Checkpoint C written: {checkpoint_c_path}")
+
         # 5. Advanced rolling features 
-        #collect to eagar for next steps
         logger.info("  Step 5: Advanced rolling features (burst, time-gaps, velocity)...")
-        if isinstance(df, pl.LazyFrame):
-            logger.info(" Materializing the Lazyframe (Switching to Eager)...")
-            df = df.collect(engine="streaming")
-        
-        df = df.sort(['Account_HASHED', 'Timestamp'])
         df = add_advanced_rolling_features(df)
 
-        logger.info(">>>REACHED BEFORE COUNTERPARTY FEATURES<<<")
+        logger.info("  CHECKPOINT D: Materializing advanced features...")
+        checkpoint_d_path = output_dir / f'{split_name}_checkpoint_advanced.parquet'
+        df.sink_parquet(checkpoint_d_path, compression='zstd', maintain_order=False)
+
+        import gc
+        gc.collect()
+        df = pl.scan_parquet(checkpoint_d_path).collect(engine='streaming')
 
         # 6. Counterparty entropy features 
         logger.info("  Step 6: Counterparty entropy and network features...")
-        assert isinstance(df, pl.DataFrame), "Counterparty features expect eagar DataFrame"
         df = add_counterparty_entropy_features(df)
-        logger.info(">>>FINISHED COUNTERPARTY FREATURES")
         
         # 7. Network Features
         logger.info("  Step 7: Network Features...")
         df = add_network_features(df)
-
-        if isinstance(df, pl.LazyFrame):
-            df = df.collect(engine='streaming')
 
         # 8. Toxic Corridors 
         logger.info("  Step 8: Flagging Toxic Corridors...")
@@ -166,7 +189,6 @@ def build_training_features(
 
         #final collection
         if isinstance(df, pl.LazyFrame):
-            logger.info("  Final Materialization...")
             df = df.collect(engine='streaming')
        
         
@@ -327,7 +349,7 @@ def build_all_features(
 
     # Build features
     train_features, val_features, test_features = build_training_features(
-        train_df, val_df, test_df, accounts
+        train_df, val_df, test_df, accounts, output_dir
     )
     
     del train_df, val_df, test_df

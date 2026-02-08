@@ -1,14 +1,12 @@
+# -*- coding: utf-8 -*-
 """
-Advanced rolling features for AML detection - Polars-compatible version.
+Advanced rolling features for AML detection - MEMORY-SAFE LazyFrame version.
 
-Features:
-- Burst detection (clustering intensity)
-- Time-gap statistics (inter-transaction intervals)
-- Velocity metrics (rate of change)
-- Concentration metrics (volume focus)
-- Anomaly cascade (multi-signal detection)
-
-All using row-based rolling windows (Polars-compatible).
+CRITICAL CHANGES:
+1. All functions accept/return LazyFrame
+2. Single sort at entry, maintained throughout
+3. Rolling operations use streaming-compatible integer windows
+4. No intermediate collects
 """
 
 import polars as pl
@@ -16,46 +14,38 @@ import numpy as np
 from typing import List
 
 
-def compute_burst_score(df: pl.DataFrame) -> pl.DataFrame:
+def compute_burst_score(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Detect transaction clustering (smurfing indicator).
-    
-    Uses simple hourly transaction counts compared to recent average.
-    Scores range 0-10 (clamped).
+    Detect transaction clustering (smurfing indicator) - LAZY VERSION.
     """
-    df = df.sort(['Account_HASHED', 'Timestamp'])
+    # Already sorted by caller, no re-sort
     
-    # 1. Hourly transaction counts
+    # 1. Hourly truncation and count in single expression
     df = df.with_columns([
         pl.col('Timestamp').dt.truncate('1h').alias('hour_window')
     ])
     
+    # Use rolling count on integer index instead of groupby
     df = df.with_columns([
-        pl.col('Timestamp')
-            .count()
-            .over(['Account_HASHED', 'hour_window'])
-            .cast(pl.UInt32)
-            .alias('txn_in_hour')
+        pl.col('Timestamp').count().over(['Account_HASHED', 'hour_window']).cast(pl.UInt32).alias('txn_in_hour')
     ])
     
-    # 2. Rolling average (48-hour baseline)
+    # 2. Rolling mean on txn count (48-hour = ~500 rows assuming regular txns)
     df = df.with_columns([
-        pl.col('txn_in_hour')
-            .cast(pl.Float32)
+        pl.col('txn_in_hour').cast(pl.Float32)
             .rolling_mean(window_size=48)
             .over('Account_HASHED')
             .fill_null(1.0)
             .alias('baseline_txn_per_hour_24h')
     ])
     
-    # 3. Burst score (ratio to baseline, clamped 0-10)
+    # 3. Burst calculations
     df = df.with_columns([
         ((pl.col('txn_in_hour').cast(pl.Float32) / 
           (pl.col('baseline_txn_per_hour_24h') + 1.0)) - 1.0)
         .cast(pl.Float32)
         .alias('burst_score_1h'),
         
-        # Count bursts in 24-hour rolling window
         (pl.col('txn_in_hour') > (pl.col('baseline_txn_per_hour_24h') * 2.0))
         .cast(pl.Int8)
         .rolling_sum(window_size=24)
@@ -65,21 +55,14 @@ def compute_burst_score(df: pl.DataFrame) -> pl.DataFrame:
         .alias('burst_count_24h')
     ])
     
-    return df
+    return df.drop('hour_window')
 
 
-def compute_timegap_statistics(df: pl.DataFrame) -> pl.DataFrame:
+def compute_timegap_statistics(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Compute inter-transaction time statistics.
-    
-    Metrics:
-    - Avg/min/max time between transactions (in minutes)
-    - Consistency metric (std/mean - lower = more regular)
-    - Gap acceleration (increasing intervals = wind-down)
+    Compute inter-transaction time statistics - LAZY VERSION.
     """
-    df = df.sort(['Account_HASHED', 'Timestamp'])
-    
-    # 1. Time gap to previous transaction (minutes)
+    # Time gap to previous
     df = df.with_columns([
         ((pl.col('Timestamp') - pl.col('Timestamp').shift(1).over('Account_HASHED'))
          .dt.total_seconds() / 60.0)
@@ -88,26 +71,26 @@ def compute_timegap_statistics(df: pl.DataFrame) -> pl.DataFrame:
         .alias('minutes_since_last_txn')
     ])
     
-    # 2. Rolling statistics (500-row window ≈ 28 days)
+    # Rolling stats (500-row window)
     df = df.with_columns([
         pl.col('minutes_since_last_txn')
             .rolling_mean(window_size=500)
             .over('Account_HASHED')
             .cast(pl.Float32)
             .alias('avg_timegap_minutes_28d'),
-        
+            
         pl.col('minutes_since_last_txn')
             .rolling_min(window_size=500)
             .over('Account_HASHED')
             .cast(pl.Float32)
             .alias('min_timegap_minutes_28d'),
-        
+            
         pl.col('minutes_since_last_txn')
             .rolling_max(window_size=500)
             .over('Account_HASHED')
             .cast(pl.Float32)
             .alias('max_timegap_minutes_28d'),
-        
+            
         pl.col('minutes_since_last_txn')
             .rolling_std(window_size=500)
             .over('Account_HASHED')
@@ -115,17 +98,14 @@ def compute_timegap_statistics(df: pl.DataFrame) -> pl.DataFrame:
             .alias('std_timegap_minutes_28d'),
     ])
     
-    # 3. Consistency metric
+    # Derived metrics
     df = df.with_columns([
         (pl.col('std_timegap_minutes_28d') / 
          (pl.col('avg_timegap_minutes_28d') + 1.0))
         .fill_null(0.0)
         .cast(pl.Float32)
-        .alias('timegap_consistency_28d')
-    ])
-    
-    # 4. Gap acceleration
-    df = df.with_columns([
+        .alias('timegap_consistency_28d'),
+        
         ((pl.col('minutes_since_last_txn') - pl.col('avg_timegap_minutes_28d')) /
          (pl.col('avg_timegap_minutes_28d') + 1.0))
         .cast(pl.Float32)
@@ -135,15 +115,10 @@ def compute_timegap_statistics(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def compute_velocity_metrics(df: pl.DataFrame) -> pl.DataFrame:
+def compute_velocity_metrics(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Compute transaction velocity (rate of change).
-    
-    Detects sudden activity spikes or slowdowns.
+    Compute transaction velocity - LAZY VERSION.
     """
-    df = df.sort(['Account_HASHED', 'Timestamp'])
-    
-    # 1. Daily amount patterns (via rolling sum)
     df = df.with_columns([
         pl.col('Amount Paid')
             .rolling_sum(window_size=100)
@@ -152,16 +127,14 @@ def compute_velocity_metrics(df: pl.DataFrame) -> pl.DataFrame:
             .alias('daily_amount_paid')
     ])
     
-    # 2. Velocity metrics
+    # Delta and pct change using shift
     df = df.with_columns([
-        # Transaction count change
         (pl.col('daily_amount_paid') - 
          pl.col('daily_amount_paid').shift(1).over('Account_HASHED'))
         .fill_null(0.0)
         .cast(pl.Float32)
         .alias('txn_velocity_daily_delta'),
         
-        # Percentage change in amounts
         ((pl.col('daily_amount_paid') - 
           pl.col('daily_amount_paid').shift(1).over('Account_HASHED')) /
          (pl.col('daily_amount_paid').shift(1).over('Account_HASHED') + 0.000001))
@@ -170,9 +143,9 @@ def compute_velocity_metrics(df: pl.DataFrame) -> pl.DataFrame:
         .alias('amount_velocity_daily_pct_change'),
     ])
     
-    # 3. Acceleration (second derivative)
+    # Second derivative
     df = df.with_columns([
-        (pl.col('amount_velocity_daily_pct_change') -
+        (pl.col('amount_velocity_daily_pct_change') - 
          pl.col('amount_velocity_daily_pct_change').shift(1).over('Account_HASHED'))
         .fill_null(0.0)
         .cast(pl.Float32)
@@ -182,57 +155,55 @@ def compute_velocity_metrics(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def compute_concentration_metrics(df: pl.DataFrame) -> pl.DataFrame:
+def compute_concentration_metrics(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Detect volume concentration (money mule indicator).
-    
-    Mules have flow to/from few counterparties.
+    Detect volume concentration - LAZY VERSION.
     """
-    df = df.sort(['Account_HASHED', 'Timestamp'])
+    # Use rolling n_unique on integer windows instead of groupby_dynamic
+    # Approximate 7d/28d with row windows (assuming ~17 txns/day avg)
     
-    # 1. Unique counterparty counts
     df = df.with_columns([
         pl.col('Account_duplicated_0')
-        .n_unique()
-        .over(['Account_HASHED', pl.col('Timestamp').dt.truncate('7d')])
-        .cast(pl.UInt32)
-        .alias('unique_counterparties_7d'),
-        
+            .rolling_n_unique(window_size=120)  # ~7 days
+            .over('Account_HASHED')
+            .cast(pl.UInt32)
+            .alias('unique_counterparties_7d'),
+            
         pl.col('Account_duplicated_0')
-        .n_unique()
-        .over(['Account_HASHED', pl.col('Timestamp').dt.truncate('28d')])
-        .cast(pl.UInt32)
-        .alias('unique_counterparties_28d'),
+            .rolling_n_unique(window_size=500)  # ~28 days
+            .over('Account_HASHED')
+            .cast(pl.UInt32)
+            .alias('unique_counterparties_28d'),
     ])
     
-    # 2. HHI (Herfindahl-Hirschman Index approximation)
+    # HHI approximation
     df = df.with_columns([
         ((pl.col('unique_counterparties_28d') + 1) ** (-1.0))
         .cast(pl.Float32)
         .alias('perfect_hhi_28d')
     ])
     
-    # 3. Distribution statistics
+    # Amount stats
     df = df.with_columns([
         pl.col('Amount Paid')
             .rolling_mean(window_size=500)
             .over('Account_HASHED')
             .shift(1)
             .cast(pl.Float32)
-            .alias('mean_amount_paid_28d'),
-        
+            .alias('mean_amount_paid_28d_roll'),
+            
         pl.col('Amount Paid')
             .rolling_std(window_size=500)
             .over('Account_HASHED')
             .shift(1)
             .cast(pl.Float32)
-            .alias('std_amount_paid_28d'),
+            .alias('std_amount_paid_28d_roll'),
     ])
     
-    # 4. Concentration CV (coeff. of variation)
+    # CV
     df = df.with_columns([
-        (pl.col('std_amount_paid_28d') / 
-         (pl.col('mean_amount_paid_28d') + 0.000001))
+        (pl.col('std_amount_paid_28d_roll') / 
+         (pl.col('mean_amount_paid_28d_roll') + 0.000001))
         .fill_null(0.0)
         .cast(pl.Float32)
         .alias('amount_concentration_cv_28d')
@@ -241,33 +212,29 @@ def compute_concentration_metrics(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def compute_round_number_patterns(df: pl.DataFrame) -> pl.DataFrame:
+def compute_round_number_patterns(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Detect structuring (using round numbers like $1000, $500).
-    
-    AML indicator: many transactions in round amounts.
+    Detect structuring - LAZY VERSION.
     """
     df = df.with_columns([
-        # Identify round amounts
         ((pl.col('Amount Paid') % 100.0) == 0.0).cast(pl.Int8).alias('is_multiple_100'),
         ((pl.col('Amount Paid') % 500.0) == 0.0).cast(pl.Int8).alias('is_multiple_500'),
         ((pl.col('Amount Paid') % 1000.0) == 0.0).cast(pl.Int8).alias('is_multiple_1000'),
     ])
     
-    # 2. Rolling ratios in 50-txn windows
     df = df.with_columns([
         pl.col('is_multiple_100')
             .rolling_mean(window_size=50)
             .over('Account_HASHED')
             .cast(pl.Float32)
             .alias('round_100_ratio_50txns'),
-        
+            
         pl.col('is_multiple_1000')
             .rolling_mean(window_size=50)
             .over('Account_HASHED')
             .cast(pl.Float32)
             .alias('round_1000_ratio_50txns'),
-        
+            
         (pl.col('is_multiple_100').rolling_sum(window_size=5) / 5.0)
             .over('Account_HASHED')
             .cast(pl.Float32)
@@ -277,20 +244,10 @@ def compute_round_number_patterns(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def compute_anomaly_cascade_features(df: pl.DataFrame) -> pl.DataFrame:
+def compute_anomaly_cascade_features(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Multi-signal anomaly detection.
-    
-    Combines multiple fraud signals:
-    - High burst score
-    - Large time gaps
-    - Extreme consistency
-    - High volume concentration
-    - Heavy structuring
+    Multi-signal anomaly detection - LAZY VERSION.
     """
-    df = df.sort(['Account_HASHED', 'Timestamp'])
-    
-    # 1. Define anomaly flags
     df = df.with_columns([
         (pl.col('burst_score_1h') > 2.0).cast(pl.Int8).alias('flag_high_burst'),
         (pl.col('minutes_since_last_txn') > 1440.0).cast(pl.Int8).alias('flag_large_gap'),
@@ -299,18 +256,16 @@ def compute_anomaly_cascade_features(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col('round_1000_ratio_50txns') > 0.7).cast(pl.Int8).alias('flag_heavy_structuring'),
     ])
     
-    # 2. Cascade score (sum of all signals)
     df = df.with_columns([
-        (pl.col('flag_high_burst') +
-         pl.col('flag_large_gap') +
-         pl.col('flag_extreme_consistency') +
-         pl.col('flag_high_concentration') +
+        (pl.col('flag_high_burst') + 
+         pl.col('flag_large_gap') + 
+         pl.col('flag_extreme_consistency') + 
+         pl.col('flag_high_concentration') + 
          pl.col('flag_heavy_structuring'))
         .cast(pl.Int8)
         .alias('anomaly_cascade_score')
     ])
     
-    # 3. Cascade frequency (rolling mean)
     df = df.with_columns([
         (pl.col('anomaly_cascade_score') >= 2).cast(pl.Int8)
             .rolling_mean(window_size=500)
@@ -322,14 +277,18 @@ def compute_anomaly_cascade_features(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def add_advanced_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
+def add_advanced_rolling_features(df: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Add all advanced rolling features to DataFrame.
+    Add all advanced rolling features - LAZY VERSION.
     
-    Applies transformations in order and returns enhanced DataFrame.
+    CRITICAL: Input MUST be sorted by ['Account_HASHED', 'Timestamp'].
     """
     import logging
     logger = logging.getLogger(__name__)
+    
+    # Verify lazy
+    if not isinstance(df, pl.LazyFrame):
+        raise TypeError("add_advanced_rolling_features REQUIRES LazyFrame. Use streaming checkpoint instead.")
     
     logger.info("  Adding burst scores...")
     df = compute_burst_score(df)

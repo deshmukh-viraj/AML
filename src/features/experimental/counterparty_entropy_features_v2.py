@@ -17,55 +17,39 @@ import gc
 
 logger = logging.getLogger(__name__)
 
-def compute_counterparty_entropy(df: pl.DataFrame, chunk_size: int = 10000 ) -> pl.DataFrame:
+def compute_counterparty_entropy(df: pl.DataFrame, chunk_size: int = 10000) -> pl.DataFrame:
     """
     Shannon entropy-like diversity metrics for counterparties.
-    
-    Lower entropy = fewer unique counterparties (mule indicator).
+    REFACTORED: Eliminate chunked filtering, use single lazy aggregation.
     """
-    unique_accounts = df.select('Account_HASHED').unique()['Account_HASHED'].to_list()
-    total_accounts = len(unique_accounts)
-
-    result = []
-    for i in range(0, total_accounts, chunk_size):
-        chunk_accounts = unique_accounts[i:i+chunk_size]
-
-        chunk_df = df.filter(pl.col('Account_HASHED').is_in(chunk_accounts))
+    logger = logging.getLogger(__name__)
     
-        # Count transactions per counterparty
-        txn_per_counterparty = chunk_df.group_by(['Account_HASHED', 'Account_duplicated_0']).agg(
-            pl.count().cast(pl.UInt32).alias('txn_count')
-        )
-            
-        # Compute entropy
-        txn_per_counterparty = txn_per_counterparty.with_columns([
+    # Single-pass aggregation (NO chunking, NO filtering)
+    entropy_features = (
+        df.lazy()
+        .group_by(['Account_HASHED', 'Account_duplicated_0'])
+        .agg(pl.count().cast(pl.UInt32).alias('txn_count'))
+        .with_columns([
             pl.col('txn_count').sum().over('Account_HASHED').alias('total_txns'),
             (pl.col('txn_count') / pl.col('txn_count').sum().over('Account_HASHED'))
-            .cast(pl.Float32)
-            .alias('probability')
+                .cast(pl.Float32)
+                .alias('probability')
         ])
-        
-        txn_per_counterparty = txn_per_counterparty.with_columns([
+        .with_columns([
             (pl.col('probability') * pl.col('probability').log())
-            .fill_null(0.0)
-            .sum()
-            .over('Account_HASHED')
-            .cast(pl.Float32)
-            .alias('entropy_value')
+                .fill_null(0.0)
+                .sum()
+                .over('Account_HASHED')
+                .cast(pl.Float32)
+                .alias('entropy_value')
         ])
+        .select(['Account_HASHED', 'entropy_value'])
+        .unique()
+        .collect(engine='streaming')  # Streaming collect for aggregation
+    )
     
-        entropy = txn_per_counterparty.select(['Account_HASHED', 'entropy_value']).unique()
-        result.append(entropy)
-
-        if (i // chunk_size + 1) % 10 == 0:
-            logger.info(f"  Processed {i + chunk_size} / {total_accounts} accounts")
-
-        del chunk_df, txn_per_counterparty, entropy
-        gc.collect()
-    
-    entropy_combined = pl.concat(result)
-    # Merge back to original
-    df = df.join(entropy_combined, on='Account_HASHED', how='left')
+    # Join back (now both are eager DataFrames)
+    df = df.join(entropy_features, on='Account_HASHED', how='left')
     
     df = df.with_columns([
         pl.col('entropy_value').fill_null(0.0).cast(pl.Float32).alias('counterparty_entropy_28d')
