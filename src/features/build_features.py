@@ -121,7 +121,7 @@ def build_training_features(
 
         # 2.1 Join precompute entity/accounts stats if available
         if entity_stats_lazy is not None:
-            logger.info("  Step 2.5: Joining entity/accounts stats into transactions....")
+            logger.info("   Step 2.5: Joining entity/accounts stats into transactions....")
             df = df.join(entity_stats_lazy, left_on='Account_HASHED', right_on='Account Number_HASHED', how='left')
 
             assert 'Account_HASHED' in df.columns or isinstance(df, pl.LazyFrame), "Expected Account_HASHED in transaction df"
@@ -131,10 +131,10 @@ def build_training_features(
         # Checkpoint A: 
         logger.info("   CHECKPOINT A: Materializing base + entity features...")
         checkpoint_a_path = output_dir / f'{split_name}_checkpoint_base.parquet'
-        df.sink_parquet(checkpoint_a_path, compression='zstd',)
+        df.collect(engine='streaming').write_parquet(checkpoint_a_path, compression=None, row_group_size=100_000)
 
         df = pl.scan_parquet(checkpoint_a_path)
-        logger.info(f"  Checkpoint A written: {checkpoint_a_path}")
+        logger.info(f"   Checkpoint A written: {checkpoint_a_path}")
 
         import gc
         gc.collect()
@@ -151,28 +151,64 @@ def build_training_features(
         # Checkpoint B: after all basic rolling/ratio features
         logger.info("   CHECKPOINT B: Materializing rolling + ratio features...")
         checkpoint_b_path = output_dir / f'{split_name}_checkpoint_rolling_ratio.parquet'
-        df.sink_parquet(checkpoint_b_path, compression='zstd',)
+        df.collect(engine='streaming').write_parquet(checkpoint_b_path, compression=None, row_group_size=100_000)
 
         df = pl.scan_parquet(checkpoint_b_path)
-        logger.info(f"  Checkpoint B written: {checkpoint_b_path}")
+        logger.info(f"   Checkpoint B written: {checkpoint_b_path}")
 
         import gc
         gc.collect()
 
-        # 5. Advanced rolling features 
-        logger.info("   Step 5: Advanced rolling features (burst, time-gaps, velocity)...")
-        df = add_advanced_rolling_features(df)
+        adv_rolling_ip_cols = [
+            'Account_HASHED', 'Timestamp', 'Amount Paid', 'Amount Received'
+        ]
 
-        # Cjeckpoint C: after advanced rolling
-        logger.info("   CHECKPOINT C: Materializing advanced rolling features...")
-        checkpoint_c_path = output_dir / f'{split_name}_checkpoint_advanced.parquet'
-        df.sink_parquet(checkpoint_c_path, compression='zstd',)
+        # 5. Advanced rolling features
+        logger.info("   Step 5: Advanced rolling features (ISOLATED + STREAMING)...")
+        checkpoint_c_path = output_dir / f"{split_name}_checkpoint_advanced.parquet"
 
-        df = pl.scan_parquet(checkpoint_c_path)
-        logger.info(f"  Checkpoint C written: {checkpoint_c_path}")
+        df_adv_input = df.select(adv_rolling_ip_cols)
 
+        # compute advanced rolling in isolation
+        df_adv = (
+            df_adv_input
+            .pipe(add_advanced_rolling_features)
+            .collect(streaming=True)
+        )
+
+        df_adv.write_parquet(checkpoint_c_path, compression=None, row_group_size=100_000)
+
+        # reattach to main frame
+        df = (
+            pl.scan_parquet(checkpoint_b_path)
+            .join(
+                pl.scan_parquet(checkpoint_c_path),
+                on=["Account_HASHED", "Timestamp"],
+                how="left"
+            )
+        )
+
+        del df_adv_input, df_adv
         import gc
         gc.collect()
+
+        logger.info(f"   Checkpoint C written: {checkpoint_c_path}")
+
+
+        # # 5. Advanced rolling features 
+        # logger.info("   Step 5: Advanced rolling features (burst, time-gaps, velocity)...")
+        # df = add_advanced_rolling_features(df)
+
+        # # Cjeckpoint C: after advanced rolling
+        # logger.info("   CHECKPOINT C: Materializing advanced rolling features...")
+        # checkpoint_c_path = output_dir / f'{split_name}_checkpoint_advanced.parquet'
+        # df.sink_parquet(checkpoint_c_path, compression='zstd',)
+
+        # df = pl.scan_parquet(checkpoint_c_path)
+        # logger.info(f"   Checkpoint C written: {checkpoint_c_path}")
+
+        # import gc
+        # gc.collect()
 
         # 6. Counterparty entropy features 
         logger.info("   Step 6: Counterparty entropy and network features...")
@@ -308,19 +344,42 @@ def build_all_features(
     logger.info("AML FEATURE ENGINEERING PIPELINE (COMPLETE)")
     logger.info("="*70)
     
-    # Load data
-    logger.info(f"\nLoading transactions from {transactions_path}")
-    trans = pl.scan_csv(
-        transactions_path, 
-        try_parse_dates=True,
-        dtypes={
-            'Amount Paid': pl.Float32,
-            'Amount Received': pl.Float32,   
-        }
-    )
+    # convert transactions data
+    trans_parquet_path = transactions_path.with_suffix('.parquet')
+
+    if trans_parquet_path.exists():
+        logger.info(f"   Found cached Parquet: {trans_parquet_path}")    
+    else:
+        logger.info(f"   Converting {transactions_path.name}...")
     
-    logger.info(f"Loading accounts from {accounts_path}")
-    accounts = pl.read_csv(accounts_path)
+        pl.scan_csv(
+            transactions_path, 
+            try_parse_dates=True,
+            dtypes={
+                'Amount Paid': pl.Float32,
+                'Amount Received': pl.Float32,   }
+        ).sink_parquet(trans_parquet_path, compression='snappy')
+
+    # covert accounts data
+    acc_parquet_path = accounts_path.with_suffix('.parquet')
+
+    if acc_parquet_path.exists():
+        logger.info(f"   Found cached Parquet: {acc_parquet_path}")
+    else:
+        logger.info(f"   Converting {accounts_path.name}...")
+    
+        df_acc = pl.read_csv(accounts_path)
+        df_acc.write_parquet(acc_parquet_path)
+
+        del df_acc
+
+    logger.info("   Loading from Parquet....")
+    # Load data from parquet files
+    logger.info(f"\nLoading transactions from {trans_parquet_path}")
+    trans = pl.scan_parquet(trans_parquet_path)
+
+    logger.info(f"Loading accounts from {acc_parquet_path}")
+    accounts = pl.read_parquet(acc_parquet_path)
     
     if sample_fraction:
         logger.info(f"Sampling {sample_fraction*100}% of transactions...")

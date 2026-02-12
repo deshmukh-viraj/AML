@@ -46,51 +46,31 @@ def compute_bank_centrality_features(df: pl.LazyFrame) -> pl.LazyFrame:
             bank_network.add_edge(from_bank, to_bank, weight=weight)
     
     # Calculate centrality metrics (unchanged)
-    out_degree = dict(bank_network.out_degree())
-    in_degree = dict(bank_network.in_degree())
-    
     try:
         pagerank = nx.pagerank(bank_network, weight='weight')
     except:
         pagerank = {node: 0.0 for node in bank_network.nodes()}
         logger.warning("PageRank calculation failed, using zeros")
     
-    try:
-        betweenness = nx.betweenness_centrality(bank_network, weight='weight')
-    except:
-        betweenness = {node: 0.0 for node in bank_network.nodes()}
-        logger.warning("Betweenness calculation failed, using zeros")
-    
     # Convert to Polars dataframes for efficient joining
     from_bank_features = pl.DataFrame({
-        'From Bank': list(out_degree.keys()),
-        'from_bank_out_degree': list(out_degree.values()),
-        'pagerank_from_bank': [pagerank.get(b, 0.0) for b in out_degree.keys()],
-        'betweenness_from_bank': [betweenness.get(b, 0.0) for b in out_degree.keys()]
+        'From Bank': list(bank_network.nodes()),
+        'from_bank_out_degree': [bank_network.out_degree(n) for n in bank_network.nodes()],
+        'pagerank_from_bank': [pagerank.get(n, 0.0) for n in bank_network.nodes()],
     })
-    
+
     to_bank_features = pl.DataFrame({
-        'To Bank': list(in_degree.keys()),
-        'to_bank_in_degree': list(in_degree.values()),
-        'pagerank_to_bank': [pagerank.get(b, 0.0) for b in in_degree.keys()],
-        'betweenness_to_bank': [betweenness.get(b, 0.0) for b in in_degree.keys()]
+        'To Bank': list(bank_network.nodes()),
+        'to_bank_in_degree': [bank_network.in_degree(n) for n in bank_network.nodes()],
+        'pagerank_to_bank': [pagerank.get(n, 0.0) for n in bank_network.nodes()],
     })
-    
+
     # Join back to original dataframe
     df = df.join(from_bank_features.lazy(), on='From Bank', how='left')
     df = df.join(to_bank_features.lazy(), on='To Bank', how='left')
-    
-    # Fill nulls with 0
-    df = df.with_columns([
-        pl.col('from_bank_out_degree').fill_null(0),
-        pl.col('to_bank_in_degree').fill_null(0),
-        pl.col('pagerank_from_bank').fill_null(0.0),
-        pl.col('pagerank_to_bank').fill_null(0.0),
-        pl.col('betweenness_from_bank').fill_null(0.0),
-        pl.col('betweenness_to_bank').fill_null(0.0)
-    ])
-    
+        
     return df
+
 
 def compute_account_network_features(df: pl.LazyFrame) -> pl.LazyFrame:
     """
@@ -104,82 +84,78 @@ def compute_account_network_features(df: pl.LazyFrame) -> pl.LazyFrame:
     logger.info("Computing account-level network features...")
     
     
-    # Counterparty diversity: count distinct 'To Bank' per account per window
+    # Counterparty diversity: count distinct 'To Bank' per account
+
     df = df.with_columns([
         pl.col('To Bank')
-            .n_unique()
-            .rolling_max_by(by='Timestamp', window_size='7d')
-            .over('Account_HASHED')
-            .shift(1)
-            .fill_null(0)
-            .cast(pl.UInt32)
-            .alias('account_counterparty_diversity_7d'),
-        
-        pl.col('To Bank')
-            .n_unique()
-            .rolling_max_by(by='Timestamp', window_size='28d')
-            .over('Account_HASHED')
-            .shift(1)
-            .fill_null(0)
-            .cast(pl.UInt32)
-            .alias('account_counterparty_diversity_28d'),
+        .eq(pl.col('To Bank').shift(1).over('Account_HASHED'))
+        .cast(pl.Int8)
+        .fill_null(0)
+        .alias('is_same_bank')
     ])
-    
+
+    # rolling sum of repeats (integer window)
     # Bank repeat rate: proportion of repeat banks (using 200-row window ≈ 7d)
     df = df.with_columns([
-        # Count occurrences of current bank in recent history
-        (pl.col('To Bank').shift(1)
+        # 7dayproxy (120 rows)
+        pl.col('is_same_bank')
+            .rolling_sum(window_size=120)
             .over('Account_HASHED')
-            .eq(pl.col('To Bank'))
-            .cast(pl.Int8)
-            .rolling_sum(window_size=200)
-            .over('Account_HASHED')
-            .shift(1)
-            .fill_null(0) /
-         (pl.len()
-             .rolling_sum(window_size=200)
-             .over('Account_HASHED')
-             .shift(1)
-             .fill_null(1)))
-        .clip(0.0, 1.0)
-        .alias('account_bank_repeat_rate_7d')
-    ])
-    
-    return df
-
-
-def compute_corridor_risk_score(df: pl.LazyFrame) -> pl.LazyFrame:
-    """
-    Create corridor-level risk aggregation feature.
-    
-    Combines From Bank -> To Bank corridor information with transaction specifics.
-    """
-    logger.info("Computing corridor-level features...")
-    
-    df = df.with_columns([
-        # Create a corridor identifier
-        (pl.col('From Bank').cast(pl.Utf8) + '_to_' + pl.col('To Bank').cast(pl.Utf8))
-            .alias('corridor')
-    ])
-    
-    # Compute corridor statistics in rolling windows (500-row window ≈ 28d)
-    df = df.with_columns([
-        pl.col('Amount Paid')
-            .rolling_mean(window_size=500)
-            .over('corridor')
             .shift(1)
             .fill_null(0)
-            .alias('corridor_mean_amount_28d'),
+            .cast(pl.Float32)
+            .alias('bank_repeat_rate_7d'),
         
-        pl.col('Amount Paid')
-            .rolling_std(window_size=500)
-            .over('corridor')
+        pl.col('is_same_bank')
+            .rolling_sum(window_size=500)
+            .over('Account_HASHED')
             .shift(1)
             .fill_null(0)
-            .alias('corridor_std_amount_28d'),
+            .cast(pl.Float32)
+            .alias('bank_repeat_rate_28d'),
     ])
     
-    return df
+    # diversity proxy
+    # if repeat rate is low (e.g 0.1), diversity is high 0.9
+    df = df.with_columns([
+        (1.0 - pl.col('bank_repeat_rate_7d')).alias('bank_diversity_proxy_7d'),
+        (1.0 - pl.col('bank_repeat_rate_28d')).alias('bank_diversity_proxy_28d')
+    ])
+    return df.drop('is_same_bank')
+
+
+# def compute_corridor_risk_score(df: pl.LazyFrame) -> pl.LazyFrame:
+    # """
+    # Create corridor-level risk aggregation feature.
+    
+    # Combines From Bank -> To Bank corridor information with transaction specifics.
+    # """
+    # logger.info("Computing corridor-level features...")
+    
+    # df = df.with_columns([
+    #     # Create a corridor identifier
+    #     (pl.col('From Bank').cast(pl.Utf8) + '_to_' + pl.col('To Bank').cast(pl.Utf8))
+    #         .alias('corridor')
+    # ])
+    
+    # # Compute corridor statistics in rolling windows (500-row window ≈ 28d)
+    # df = df.with_columns([
+    #     pl.col('Amount Paid')
+    #         .rolling_mean(window_size=500)
+    #         .over('corridor')
+    #         .shift(1)
+    #         .fill_null(0)
+    #         .alias('corridor_mean_amount_28d'),
+        
+    #     pl.col('Amount Paid')
+    #         .rolling_std(window_size=500)
+    #         .over('corridor')
+    #         .shift(1)
+    #         .fill_null(0)
+    #         .alias('corridor_std_amount_28d'),
+    # ])
+    
+    # return df
 
 
 def add_network_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -198,8 +174,8 @@ def add_network_features(df: pl.DataFrame) -> pl.DataFrame:
     logger.info("  Computing account network....")
     df = compute_account_network_features(df)
 
-    logger.info("  Computing corridor risk score...")
-    df = compute_corridor_risk_score(df)
+    # logger.info("  Computing corridor risk score...")
+    # df = compute_corridor_risk_score(df)
 
     # Return the enhanced DataFrame. Keep networks in local variables in case
     # they are needed later; if needed, consider returning them as well.
