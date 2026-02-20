@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 def compute_counterparty_entropy(df: pl.LazyFrame, chunk_size: int = 10000) -> pl.LazyFrame:
     """
     Shannon entropy-like diversity metrics for counterparties.
-    REFACTORED: Eliminate chunked filtering, use single lazy aggregation.
     """
     logger = logging.getLogger(__name__)
     

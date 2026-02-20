@@ -55,6 +55,116 @@ def optimize_dtypes(df: pl.LazyFrame) -> pl.LazyFrame:
         pl.col('Amount Received').cast(pl.Float32)
     ])
 
+import shutil
+def process_spilts_in_batches(
+    df: pl.LazyFrame,
+    split_name: str,
+    entity_stats_lazy: Optional[pl.LazyFrame],
+    output_dir: Path, 
+    batch_size: int = 10000
+) -> Path:
+
+    logger.info(f"BATCH PROCESSING: {split_name.upper()}")
+    
+    #create temp directory for split batches
+    temp_dir = output_dir / f"temp_batches_{split_name}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    #get unique accounts
+    unique_acc = df.select('Account_HASHED').unique().collect().to_series().to_list()
+
+    n_acc = len(unique_acc)
+    n_batches = (n_acc + batch_size -1)// batch_size
+
+    logger.info(f"   Total accounts: {n_acc:,}")
+    logger.info(f"   Batch size: {batch_size:,} accounts")
+    logger.info(f"   Number of batches: {n_batches}")
+    logger.info(f"   Estimated time: {n_batches * 15}-{n_batches * 25} minutes")
+
+    batch_results = []
+
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, n_acc)
+        batch_acc = unique_acc[start_idx:end_idx]
+
+        logger.info(f"BATCH {batch_idx+1}/{n_batches} ({len(batch_acc):,} accounts)")
+
+        #filter to batch accounts
+        df_batch = df.filter(pl.col('Account_HASHED').is_in(batch_acc))
+
+        # 0. Optimize dtypes
+        df_batch = optimize_dtypes(df_batch)
+        
+        # 1. Sort for rolling features
+        logger.info("   Step 1: Sorting(maintained through pipeline)...")
+        df_batch = df_batch.sort(['Account_HASHED', 'Timestamp'])
+        
+        # 2. Base features
+        logger.info("   Step 2: Base features...")
+        df_batch = add_base_features(df_batch)
+
+        # 2.1 Join precompute entity/accounts stats if available
+        if entity_stats_lazy is not None:
+            logger.info("   Step 2.5: Joining entity/accounts stats into transactions....")
+            df_batch = df_batch.join(entity_stats_lazy, left_on='Account_HASHED', right_on='Account Number_HASHED', how='left')
+
+            assert 'Account_HASHED' in df.columns or isinstance(df, pl.LazyFrame), "Expected Account_HASHED in transaction df"
+            if entity_stats_lazy is not None:
+                assert 'Account Number_HASHED' in entity_stats_lazy.columns, "entity_stats must contain Account Number_HASHED for join"
+
+        # 3. Standard rolling features (from original pipeline)
+        logger.info("   Step 3: Standard rolling features...")
+        df_batch = compute_rolling_features(df_batch)
+   
+        # 4. Derived/ratio features
+        logger.info("   Step 4: Ratio and Derived features...")
+        df_batch = compute_advanced_features(df_batch)
+        df_batch = compute_derived_features(df_batch)
+
+        # 5. Advanced rolling features
+        logger.info("   Step 5: Advanced rolling features...")
+        df_batch = add_advanced_rolling_features(df_batch)
+        
+        # 6. Counterparty entropy
+        logger.info("   Step 6: Counterparty entropy features...")
+        df_batch = add_counterparty_entropy_features(df_batch)
+        
+        # 7. Network features
+        logger.info("   Step 7: Network features...")
+        df_batch = add_network_features(df_batch)
+        
+        # 8. Toxic corridors
+        logger.info("   Step 8: Toxic corridor features...")
+        df_batch = apply_toxic_corridor_features(df_batch, toxic_corridors=None)
+        
+        # Collect this batch
+        logger.info(f"   Collecting batch {batch_idx+1} (streaming)...")
+        df_batch_collected = df_batch.collect(engine='streaming')
+        
+        logger.info(f"   Batch {batch_idx+1} collected: {len(df_batch_collected):,} rows, {len(df_batch_collected.columns)} columns")
+        
+        batch_file = temp_dir / f"batch_{batch_idx:04d}.parquet"
+        df_batch_collected.write_parquet(batch_file)
+        logger.info(f"   Batch {batch_idx+1} saved to disk: {len(df_batch_collected):,} rows")
+        #batch_results.append(df_batch_collected)
+
+        del df_batch, df_batch_collected
+        gc.collect()
+
+    logger.info(f"CONCATENATING {n_batches} BATCHES")
+    
+    #final output path for split
+    final_op_path = output_dir / f"{split_name}_features.parquet"
+
+    pl.scan_parquet(temp_dir / "*.parquet").sink_parquet(final_op_path)
+    logger.info(f"  Final {split_name} saved directly to: {final_op_path}")
+
+    shutil.rmtree(temp_dir)
+    # del batch_results
+    # gc.collect()
+    return final_op_path
+
 
 def build_training_features(
     train_df: pl.LazyFrame,
@@ -62,7 +172,7 @@ def build_training_features(
     test_df: pl.LazyFrame,
     accounts: Optional[pl.DataFrame] = None,
     output_dir: Path = Path('./aml_features')
-) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+) -> Tuple[Path, Path, Path]:
 
     """
     Build all features for training, validation, and test sets.
@@ -108,89 +218,119 @@ def build_training_features(
         logger.info(f"Processing {split_name.upper()} split")
         logger.info(f"{'='*70}")
         
-        # 0. Optimize dtypes
-        df = optimize_dtypes(df)
-        
-        # 1. Sort for rolling features
-        logger.info("   Step 1: Sorting(maintained through pipeline)...")
-        df = df.sort(['Account_HASHED', 'Timestamp'])
-        
-        # 2. Base features
-        logger.info("   Step 2: Base features...")
-        df = add_base_features(df)
-
-        # 2.1 Join precompute entity/accounts stats if available
-        if entity_stats_lazy is not None:
-            logger.info("   Step 2.5: Joining entity/accounts stats into transactions....")
-            df = df.join(entity_stats_lazy, left_on='Account_HASHED', right_on='Account Number_HASHED', how='left')
-
-            assert 'Account_HASHED' in df.columns or isinstance(df, pl.LazyFrame), "Expected Account_HASHED in transaction df"
-            if entity_stats_lazy is not None:
-                assert 'Account Number_HASHED' in entity_stats_lazy.columns, "entity_stats must contain Account Number_HASHED for join"
-        
-        # Checkpoint A: 
-        logger.info("   CHECKPOINT A: Materializing base + entity features...")
-        checkpoint_a_path = output_dir / f'{split_name}_checkpoint_base.parquet'
-        df.sink_parquet(checkpoint_a_path, compression='zstd')
-
-        df = pl.scan_parquet(checkpoint_a_path)
-        logger.info(f"   Checkpoint A written: {checkpoint_a_path}")
-
-        import gc
+        output_path = process_spilts_in_batches(
+            df=df, split_name=split_name,
+            entity_stats_lazy=entity_stats_lazy,
+            output_dir=output_dir,
+            batch_size=15000
+        )
+        processed_splits[split_name] = output_path
+        logger.info(f"\n{split_name.upper()} split complete")
         gc.collect()
 
-        # 3. Standard rolling features (from original pipeline)
-        logger.info("   Step 3: Standard rolling features...")
-        df = compute_rolling_features(df)
+
+        # # 0. Optimize dtypes
+        # df = optimize_dtypes(df)
+        
+        # # 1. Sort for rolling features
+        # logger.info("   Step 1: Sorting(maintained through pipeline)...")
+        # df = df.sort(['Account_HASHED', 'Timestamp'])
+        
+        # # 2. Base features
+        # logger.info("   Step 2: Base features...")
+        # df = add_base_features(df)
+
+        # # 2.1 Join precompute entity/accounts stats if available
+        # if entity_stats_lazy is not None:
+        #     logger.info("   Step 2.5: Joining entity/accounts stats into transactions....")
+        #     df = df.join(entity_stats_lazy, left_on='Account_HASHED', right_on='Account Number_HASHED', how='left')
+
+        #     assert 'Account_HASHED' in df.columns or isinstance(df, pl.LazyFrame), "Expected Account_HASHED in transaction df"
+        #     if entity_stats_lazy is not None:
+        #         assert 'Account Number_HASHED' in entity_stats_lazy.columns, "entity_stats must contain Account Number_HASHED for join"
+        
+        # # Checkpoint A: 
+        # logger.info("   CHECKPOINT A: Materializing base + entity features...")
+        # checkpoint_a_path = output_dir / f'{split_name}_checkpoint_base.parquet'
+        # df.collect(engine='streaming').write_parquet(checkpoint_a_path, compression=None, row_group_size=100_000)
+
+        # df = pl.scan_parquet(checkpoint_a_path)
+        # logger.info(f"   Checkpoint A written: {checkpoint_a_path}")
+
+        # import gc
+        # gc.collect()
+
+        # # 3. Standard rolling features (from original pipeline)
+        # logger.info("   Step 3: Standard rolling features...")
+        # df = compute_rolling_features(df)
    
-        # 4. Derived/ratio features
-        logger.info("   Step 4: Ratio and Derived features...")
-        df = compute_advanced_features(df)
-        df = compute_derived_features(df)
+        # # 4. Derived/ratio features
+        # logger.info("   Step 4: Ratio and Derived features...")
+        # df = compute_advanced_features(df)
+        # df = compute_derived_features(df)
 
-        # Checkpoint B: after all basic rolling/ratio features
-        logger.info("   CHECKPOINT B: Materializing rolling + ratio features...")
-        checkpoint_b_path = output_dir / f'{split_name}_checkpoint_rolling_ratio.parquet'
-        df.sink_parquet(checkpoint_b_path, compression='zstd')
+        # # Checkpoint B: after all basic rolling/ratio features
+        # logger.info("   CHECKPOINT B: Materializing rolling + ratio features...")
+        # checkpoint_b_path = output_dir / f'{split_name}_checkpoint_rolling_ratio.parquet'
+        # df.collect(engine='streaming').write_parquet(checkpoint_b_path, compression=None, row_group_size=100_000)
 
-        df = pl.scan_parquet(checkpoint_b_path)
-        logger.info(f"   Checkpoint B written: {checkpoint_b_path}")
+        # df = pl.scan_parquet(checkpoint_b_path)
+        # logger.info(f"   Checkpoint B written: {checkpoint_b_path}")
 
-        import gc
-        gc.collect()
+        # import gc
+        # gc.collect()
 
-        adv_rolling_ip_cols = [
-            'Account_HASHED', 'Timestamp', 'Amount Paid', 'Amount Received', 'Account_duplicated_0', 
-        ]
+        # adv_rolling_ip_cols = [
+        #     'Account_HASHED', 'Timestamp', 'Amount Paid', 'Amount Received', 'Account_duplicated_0',
+        # ]
 
-        # 5. Advanced rolling features
-        logger.info("   Step 5: Advanced rolling features (ISOLATED + STREAMING)...")
-        checkpoint_c_path = output_dir / f"{split_name}_checkpoint_advanced.parquet"
+        # # 5. Advanced rolling features
+        # logger.info("   Step 5: Advanced rolling features (ISOLATED + STREAMING)...")
+        # checkpoint_c_path = output_dir / f"{split_name}_checkpoint_advanced.parquet"
 
-        df_adv_input = df.select(adv_rolling_ip_cols)
+        # df_adv_input = df.select(adv_rolling_ip_cols)
 
-        # compute advanced rolling in isolation
-        df_adv = (
-            df_adv_input
-            .pipe(add_advanced_rolling_features)
-            .sink_parquet(checkpoint_c_path, compression='zstd')
-        )
-        # reattach to main frame
-        df = (
-            pl.scan_parquet(checkpoint_b_path)
-            .join(
-                pl.scan_parquet(checkpoint_c_path),
-                on=["Account_HASHED", "Timestamp"],
-                how="left"
-            )
-        )
+        # # compute advanced rolling in isolation
+        # df_adv = (
+        #     df_adv_input
+        #     .pipe(add_advanced_rolling_features)
+        #     .collect(streaming=True)
+        # )
 
-        del df_adv_input, df_adv
-        import gc
-        gc.collect()
+        # df_adv.write_parquet(checkpoint_c_path, compression=None, row_group_size=100_000)
 
-        logger.info(f"   Checkpoint C written: {checkpoint_c_path}")
-        
+        # # reattach to main frame
+        # df = (
+        #     pl.scan_parquet(checkpoint_b_path)
+        #     .join(
+        #         pl.scan_parquet(checkpoint_c_path),
+        #         on=["Account_HASHED", "Timestamp"],
+        #         how="left"
+        #     )
+        # )
+
+        # del df_adv_input, df_adv
+        # import gc
+        # gc.collect()
+
+        # logger.info(f"   Checkpoint C written: {checkpoint_c_path}")
+
+
+        # # # 5. Advanced rolling features 
+        # # logger.info("   Step 5: Advanced rolling features (burst, time-gaps, velocity)...")
+        # # df = add_advanced_rolling_features(df)
+
+        # # # Cjeckpoint C: after advanced rolling
+        # # logger.info("   CHECKPOINT C: Materializing advanced rolling features...")
+        # # checkpoint_c_path = output_dir / f'{split_name}_checkpoint_advanced.parquet'
+        # # df.sink_parquet(checkpoint_c_path, compression='zstd',)
+
+        # # df = pl.scan_parquet(checkpoint_c_path)
+        # # logger.info(f"   Checkpoint C written: {checkpoint_c_path}")
+
+        # # import gc
+        # # gc.collect()
+
         # # 6. Counterparty entropy features 
         # logger.info("   Step 6: Counterparty entropy and network features...")
         # df = add_counterparty_entropy_features(df)
@@ -203,63 +343,16 @@ def build_training_features(
         # logger.info("   Step 8: Flagging Toxic Corridors...")
         # df = apply_toxic_corridor_features(df, toxic_corridors=None)
 
-        # Checkpoint D: Materializing the counterparty entropy features
-        logger.info("   Steps 6: Couterparty entropy features (ISOLATED)...")
-        checkpoint_d_path = output_dir / f"{split_name}_checkpoint_conterarty.parquet"
-        cp_ip_cols = ['Account_HASHED', 'Timestamp', 'Account_duplicated_0', 'total_amount_paid_28d',
-                       'total_amount_received_28d', 'txn_count_28d']
-        
-        df_cp_input = df.select(cp_ip_cols)
-
-        logger.info("   Computing counterparty entropy features...")
-        df_cp = (
-            df_cp_input
-            .pipe(add_counterparty_entropy_features)
-            .collect(engine='streaming')
-            .sink_parquet(checkpoint_d_path, compression='zstd')
-        )
-        
-        del df_cp_input, df_cp
-        gc.collect()
-
-        logger.info(f"    Checkpoint D written: {checkpoint_d_path}")
-
-        # Checkpoint E: Network + Toxic corridors
-        logger.info("   Step 7-8: Network + Toxic features (ISOLATED)...")
-        checkpoint_e_path = output_dir / f"{split_name}_chekpoint_network.parquet"
-
-        net_ip_cols = ['Account_HASHED', 'Timestamp', 'From Bank', 'To Bank', 'Amount Paid', 'Amount Received']
-
-        df_net_input = df.select(net_ip_cols)
-        df_net = (
-            df_net_input
-            .pipe(add_network_features)
-            .pipe(apply_toxic_corridor_features, toxic_corridors=None)
-            .collect(engine='streaming')
-            .sink_parquet(checkpoint_e_path, compression='zstd')
-        )
-
-        del df_net, df_net_input
-        gc.collect()
-        logger.info(f"   Checkpoint E written: {checkpoint_e_path}")
-
-        # rejoin to main
-        df = (pl.scan_parquet(checkpoint_b_path).join
-        (pl.scan_parquet(checkpoint_c_path), on=['Account_HASHED', 'Timestamp'], how='left').join
-             (pl.scan_parquet(checkpoint_d_path), on=['Account_HASHED', 'Timestamp'], how='left').join
-             (pl.scan_parquet(checkpoint_e_path), on=['Account_HASHED', 'Timstamp'], how='left')
-        )
-
-        #final collection
-        logger.info(f"  Final collection for {split_name} (streaming)..")
-        if isinstance(df, pl.LazyFrame):
-            df = df.collect(engine='streaming')
+        # #final collection
+        # logger.info(f"  Final collection for {split_name} (streaming)..")
+        # if isinstance(df, pl.LazyFrame):
+        #     df = df.collect(engine='streaming')
        
         
-        processed_splits[split_name] = df
-        logger.info(f"  {split_name.upper()} split complete. Running Garbage Collection")
-        import gc
-        gc.collect()
+        # processed_splits[split_name] = df
+        # logger.info(f"  {split_name.upper()} split complete. Running Garbage Collection")
+        # import gc
+        # gc.collect()
     
     train_features = processed_splits['train']
     val_features = processed_splits['val']
@@ -280,7 +373,7 @@ def build_training_features(
     return train_features, val_features, test_features
 
 
-def validate_features(df: pl.DataFrame) -> Dict:
+def validate_features(file_path: Path) -> Dict:
     """
     Validate feature engineering output.
     
@@ -290,63 +383,69 @@ def validate_features(df: pl.DataFrame) -> Dict:
     - Class balance
     - Feature diversity
     """
-    logger.info("Validating feature quality...")
+    logger.info(f"Validating feature quality for {file_path.name}...")
     
+    #load as lazyframe
+    df_lazy = pl.scan_parquet(file_path)
+    cols = df_lazy.columns
+
     validation_report = {
-        'num_rows': len(df),
-        'num_features': len(df.columns),
+        'num_rows': df_lazy.select(pl.len()).collect().item(),
+        'num_features': len(cols),
     }
     
     # Check critical features for missing values
     critical_features = [
-        col for col in df.columns 
+        col for col in cols
         if 'rolling' in col or 'burst' in col or 'entropy' in col or 'anomaly' in col
     ]
     
-    for col in critical_features[:5]:
-        missing = df.select(pl.col(col).is_null().sum()).item()
-        if missing > 0:
-            logger.warning(f"   {col}: {missing} missing values")
-    
+    if critical_features:
+        exprs = [pl.col(col).is_null().sum().alias(col) for col in critical_features[:5]]
+        missing_counts = df_lazy.select(exprs).collect().row(0)
 
+        for col, missing in zip(critical_features[:5], missing_counts):
+            if missing > 0:
+                logger.warning(f"   {col}: {missing} missing values")
+    
     # Basic statistics
     logger.info(f"\nFeature Statistics:")
     logger.info(f"  Total rows: {validation_report['num_rows']}")
     logger.info(f"  Total features: {validation_report['num_features']}")
     
     # Class balance
-    if 'Is_Laundering' in df.columns or 'Is Laundering' in df.columns:
-        target_col = 'Is_Laundering' if 'Is_Laundering' in df.columns else 'Is Laundering'
-        class_counts = df.group_by(target_col).agg(pl.count().alias('count'))
-        logger.info(f"\n  Class Distribution:")
+    target_col = 'Is Laundering' if 'Is Laundering' in cols else ('Is Laundering' if 'Is Laundering' in cols else None)
+    if target_col:
+        class_counts = df_lazy.group_by(target_col).len().collect()
+        logger.info(f"\n Class Distribution: ")
         for row in class_counts.iter_rows(named=True):
-            logger.info(f"    Class {row[target_col]}: {row['count']} samples")
+            logger.info(f"   Class {row[target_col]}: {row['len']:,}samples")
     
     return validation_report
 
 
-def save_features(
-    train_df: pl.DataFrame,
-    val_df: pl.DataFrame,
-    test_df: pl.DataFrame,
-    output_dir: Path
-):
-    """Save feature sets to disk."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
+# def save_features(
+#     train_df: pl.DataFrame,
+#     val_df: pl.DataFrame,
+#     test_df: pl.DataFrame,
+#     output_dir: Path
+# ):
+#     """Save feature sets to disk."""
+#     output_dir = Path(output_dir)
+#     output_dir.mkdir(exist_ok=True, parents=True)
     
-    logger.info("\n" + "="*70)
-    logger.info("Saving Features")
-    logger.info("="*70)
+#     logger.info("\n" + "="*70)
+#     logger.info("Saving Features")
+#     logger.info("="*70)
     
-    for split_name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
-        output_path = output_dir / f'{split_name}_features.parquet'
-        df.write_parquet(output_path, compression='zstd')
-        logger.info(f" {split_name}: {len(df)} rows → {output_path}")
+#     for split_name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+#         output_path = output_dir / f'{split_name}_features.parquet'
+#         df.write_parquet(output_path, compression='zstd')
+#         logger.info(f" {split_name}: {len(df)} rows → {output_path}")
 
-        del df
-        import gc
-        gc.collect()
+#         del df
+#         import gc
+#         gc.collect()
 
 def build_all_features(
     transactions_path: Path,
@@ -442,30 +541,31 @@ def build_all_features(
     gc.collect()
 
     # Build features
-    train_features, val_features, test_features = build_training_features(
+    train_path, val_path, test_path = build_training_features(
         train_df, val_df, test_df, accounts, output_dir
     )
     
-    del train_df, val_df, test_df
-    import gc
-    gc.collect()
+    # del train_df, val_df, test_df
+    # import gc
+    # gc.collect()
     
     # Validate
-    validate_features(train_features)
+    validate_features(train_path)
     
     # Save
-    save_features(train_features, val_features, test_features, output_dir)
+    #save_features(train_features, val_features, test_features, output_dir)
     
     logger.info("\n" + "="*70)
     logger.info("✅ FEATURE ENGINEERING COMPLETE")
     logger.info("="*70)
     
-    return (
-        output_dir / 'train_features.parquet',
-        output_dir / 'val_features.parquet',
-        output_dir / 'test_features.parquet'
-    )
+    # return (
+    #     output_dir / 'train_features.parquet',
+    #     output_dir / 'val_features.parquet',
+    #     output_dir / 'test_features.parquet'
+    # )
 
+    return train_path, val_path, test_path
 
 if __name__ == '__main__':
     import sys
