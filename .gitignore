@@ -90,5 +90,6 @@ target/
 atlas
 .venv312
 .env
+ecvenv
 notebooks/aml_features/
 aml_features/

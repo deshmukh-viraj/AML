@@ -168,8 +168,8 @@ def add_network_features(df: pl.DataFrame) -> pl.DataFrame:
         "add_network_features expects a Polars DataFrame or LazyFrame"
     )
 
-    logger.info("  Computing bank centrality...")
-    df = compute_bank_centrality_features(df)
+    # logger.info("  Computing bank centrality...")
+    # df = compute_bank_centrality_features(df)
 
     logger.info("  Computing account network....")
     df = compute_account_network_features(df)

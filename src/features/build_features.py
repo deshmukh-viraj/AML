@@ -191,26 +191,65 @@ def build_training_features(
 
         logger.info(f"   Checkpoint C written: {checkpoint_c_path}")
         
-        # 6. Counterparty entropy features 
-        logger.info("   Step 6: Counterparty entropy and network features...")
-        df = add_counterparty_entropy_features(df)
+        # # 6. Counterparty entropy features 
+        # logger.info("   Step 6: Counterparty entropy and network features...")
+        # df = add_counterparty_entropy_features(df)
         
-        # 7. Network Features
-        logger.info("   Step 7: Network Features...")
-        df = add_network_features(df)
+        # # 7. Network Features
+        # logger.info("   Step 7: Network Features...")
+        # df = add_network_features(df)
 
-        # 8. Toxic Corridors 
-        logger.info("   Step 8: Flagging Toxic Corridors...")
-        df = apply_toxic_corridor_features(df, toxic_corridors=None)
+        # # 8. Toxic Corridors 
+        # logger.info("   Step 8: Flagging Toxic Corridors...")
+        # df = apply_toxic_corridor_features(df, toxic_corridors=None)
 
-        # Checkpoint D: Materializing the counterparty, network, toxic corridots
-        logger.info("   Checkpoint D: Materializing the couterparty + network + toxic corridors...")
-        checkpoint_d_path = output_dir / f"{split_name}_checkpoint_final.parquet"
-        df.sink_parquet(checkpoint_d_path, compression='zstd')
-
-        df = pl.scan_parquet(checkpoint_d_path)
-        logger.info(f"   Chekpoint D written: {checkpoint_d_path}")
+        # Checkpoint D: Materializing the counterparty entropy features
+        logger.info("   Steps 6: Couterparty entropy features (ISOLATED)...")
+        checkpoint_d_path = output_dir / f"{split_name}_checkpoint_conterarty.parquet"
+        cp_ip_cols = ['Account_HASHED', 'Timestamp', 'Account_duplicated_0', 'total_amount_paid_28d',
+                       'total_amount_received_28d', 'txn_count_28d']
         
+        df_cp_input = df.select(cp_ip_cols)
+
+        logger.info("   Computing counterparty entropy features...")
+        df_cp = (
+            df_cp_input
+            .pipe(add_counterparty_entropy_features)
+            .collect(engine='streaming')
+            .sink_parquet(checkpoint_d_path, compression='zstd')
+        )
+        
+        del df_cp_input, df_cp
+        gc.collect()
+
+        logger.info(f"    Checkpoint D written: {checkpoint_d_path}")
+
+        # Checkpoint E: Network + Toxic corridors
+        logger.info("   Step 7-8: Network + Toxic features (ISOLATED)...")
+        checkpoint_e_path = output_dir / f"{split_name}_chekpoint_network.parquet"
+
+        net_ip_cols = ['Account_HASHED', 'Timestamp', 'From Bank', 'To Bank', 'Amount Paid', 'Amount Received']
+
+        df_net_input = df.select(net_ip_cols)
+        df_net = (
+            df_net_input
+            .pipe(add_network_features)
+            .pipe(apply_toxic_corridor_features, toxic_corridors=None)
+            .collect(engine='streaming')
+            .sink_parquet(checkpoint_e_path, compression='zstd')
+        )
+
+        del df_net, df_net_input
+        gc.collect()
+        logger.info(f"   Checkpoint E written: {checkpoint_e_path}")
+
+        # rejoin to main
+        df = (pl.scan_parquet(checkpoint_b_path).join
+        (pl.scan_parquet(checkpoint_c_path), on=['Account_HASHED', 'Timestamp'], how='left').join
+             (pl.scan_parquet(checkpoint_d_path), on=['Account_HASHED', 'Timestamp'], how='left').join
+             (pl.scan_parquet(checkpoint_e_path), on=['Account_HASHED', 'Timstamp'], how='left')
+        )
+
         #final collection
         logger.info(f"  Final collection for {split_name} (streaming)..")
         if isinstance(df, pl.LazyFrame):
