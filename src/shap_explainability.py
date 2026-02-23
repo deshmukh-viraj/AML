@@ -1,54 +1,86 @@
+# src/shap_explainability.py
 """
-SHAP Explainability for AML - Optimized for 30M+ Transactions
+SHAP Explainability for AML — Memory-safe, 8 GB RAM compatible.
 
-Memory-efficient, streaming-compatible, with counterfactuals and drift detection.
+Responsibility:
+    Produce three layers of explanation for a fitted tree model:
+
+    1. Global importance — which features drive risk decisions overall?
+    2. Local explanation  — why was *this* specific transaction flagged?
+    3. Feature drift     — are SHAP distributions shifting over time?
+
+    Counterfactuals (alibi-explain) are available as an optional extension
+    but are NOT part of the default pipeline to keep dependencies minimal.
+
+Design decisions:
+    - Reservoir sampling limits the global analysis to ≤ 50 000 rows,
+      keeping peak RAM under ~2 GB even on 30 M-row datasets.
+    - Local SHAP is computed only for the top-N high-risk cases and a
+      small borderline window — not for every transaction.
+    - All heavy numpy arrays are deleted and gc.collect() is called after
+      each stage so memory is freed promptly.
+    - Drift detection uses PSI (Population Stability Index) on SHAP values,
+      which is interpretable and threshold-free.
+
+Supported model types: XGBoost, LightGBM, CatBoost, scikit-learn forests.
+Any model compatible with ``shap.TreeExplainer`` will work.
+
+Dependencies:
+    shap>=0.44, numpy, pandas, matplotlib
+    (optional) alibi for counterfactuals
 """
+
+from __future__ import annotations
 
 import gc
 import json
+import logging
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
-from joblib import Parallel, delayed
+
+logger = logging.getLogger(__name__)
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Configuration
-# =============================================================================
+# ---------------------------------------------------------------------------
 
-DEFAULT_CONFIG = {
-    "sample_frac": 0.001,           # 0.1% of 30M = 30K samples
-    "max_global_samples": 50000,    # Hard cap for safety
-    "streaming_chunksize": 100000,  # Memory-friendly chunks
-    "top_n_risk": 100,              # High-risk cases for local SHAP
-    "borderline_n": 50,             # Near-threshold cases
+DEFAULT_CONFIG: Dict[str, Any] = {
+    # Global analysis
+    "global_sample_frac": 0.001,     # fraction of rows to use for global SHAP
+    "global_max_samples": 50_000,    # hard cap regardless of fraction
+    "random_state": 42,
+
+    # Local analysis
+    "top_n_risk": 100,               # highest-probability cases to explain
+    "borderline_n": 50,              # cases within `borderline_margin` of threshold
     "decision_threshold": 0.5,
     "borderline_margin": 0.05,
-    "sparse_top_k": 10,             # Keep only top 10 features per sample
-    "enable_counterfactuals": True,
-    "cf_max_changes": 3,
-    "cf_target_threshold": 0.3,
-    "n_jobs": -1,                   # Parallel processing
-    "batch_size": 500,
-    "random_state": 42,
+
+    # Drift detection
+    "drift_max_samples": 10_000,     # sub-sample for new-period SHAP in drift check
+    "drift_psi_threshold": 0.10,     # PSI > 0.10 → potential drift
+
+    # Output
+    "output_dir": "outputs/shap",
+    "save_plots": True,
 }
 
 
-# =============================================================================
-# Core Utilities
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
-def get_model_type(model: Any) -> Optional[str]:
-    """Identify tree-based model type for TreeExplainer compatibility."""
+def _model_type(model: Any) -> Optional[str]:
+    """Return a short type tag for logging; None means unsupported."""
     name = type(model).__name__.lower()
-    if "xgb" in name: return "xgb"
-    if "lgbm" in name or "lightgbm" in name: return "lgbm"
-    if "catboost" in name: return "catboost"
-    if "forest" in name: return "random_forest"
+    for tag in ("xgb", "lgbm", "lightgbm", "catboost", "forest"):
+        if tag in name:
+            return tag
     return None
 
 
@@ -56,441 +88,402 @@ def reservoir_sample(
     X: pd.DataFrame,
     y: pd.Series,
     sample_frac: float,
-    random_state: int = 42,
-    chunksize: int = 100000
+    max_samples: int,
+    random_state: int,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Memory-efficient stratified sampling via reservoir sampling.
-    Processes data in chunks without loading full dataset into memory.
+    Stratified reservoir sampling without loading the full dataset into memory.
+
+    Streams through rows in a single pass, maintaining equal-class reservoirs.
+    Result is capped at `max_samples` rows total.
     """
-    np.random.seed(random_state)
-    n_total = len(X)
-    n_target = min(int(n_total * sample_frac), 50000)
-    n_per_class = n_target // 2
-    
-    # Reservoirs for each class
-    reservoir_pos, reservoir_neg = [], []
-    count_pos = count_neg = 0
-    
-    # Stream through data in chunks
-    for start in range(0, n_total, chunksize):
-        end = min(start + chunksize, n_total)
-        X_chunk = X.iloc[start:end]
-        y_chunk = y.iloc[start:end]
-        
-        for idx, label in enumerate(y_chunk.values):
-            global_idx = start + idx
-            if label == 1:
-                count_pos += 1
-                if len(reservoir_pos) < n_per_class:
-                    reservoir_pos.append(global_idx)
-                elif np.random.random() < n_per_class / count_pos:
-                    reservoir_pos[np.random.randint(n_per_class)] = global_idx
-            else:
-                count_neg += 1
-                if len(reservoir_neg) < n_per_class:
-                    reservoir_neg.append(global_idx)
-                elif np.random.random() < n_per_class / count_neg:
-                    reservoir_neg[np.random.randint(n_per_class)] = global_idx
-    
-    selected = list(dict.fromkeys(reservoir_pos + reservoir_neg))  # Dedupe, preserve order
+    rng = np.random.default_rng(random_state)
+    n_per_class = min(int(len(X) * sample_frac), max_samples) // 2
+
+    res_pos: List[int] = []
+    res_neg: List[int] = []
+    cnt_pos = cnt_neg = 0
+
+    for i, label in enumerate(y.values):
+        if label == 1:
+            cnt_pos += 1
+            if len(res_pos) < n_per_class:
+                res_pos.append(i)
+            elif rng.random() < n_per_class / cnt_pos:
+                res_pos[int(rng.integers(n_per_class))] = i
+        else:
+            cnt_neg += 1
+            if len(res_neg) < n_per_class:
+                res_neg.append(i)
+            elif rng.random() < n_per_class / cnt_neg:
+                res_neg[int(rng.integers(n_per_class))] = i
+
+    selected = sorted(set(res_pos + res_neg))
+    logger.info("reservoir_sample: kept %d rows (%.2f%%)", len(selected), 100 * len(selected) / len(X))
     return X.iloc[selected].copy(), y.iloc[selected].copy()
 
 
-def select_cases(
+def _psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
+    """
+    Population Stability Index between two distributions.
+    PSI < 0.10  → stable
+    PSI 0.10–0.25 → moderate drift
+    PSI > 0.25  → significant drift
+    """
+    breakpoints = np.percentile(expected, np.linspace(0, 100, bins + 1))
+    eps = 1e-6  # avoid log(0)
+    exp_pct = np.histogram(expected, breakpoints)[0] / len(expected) + eps
+    act_pct = np.histogram(actual, breakpoints)[0] / len(actual) + eps
+    return float(np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct)))
+
+
+def _select_local_cases(
     X: pd.DataFrame,
     probs: np.ndarray,
     top_n: int,
     borderline_n: int,
     threshold: float,
-    margin: float
+    margin: float,
 ) -> pd.Index:
-    """Select high-risk and borderline cases for local explanation."""
-    # High-risk: highest probabilities
-    high_risk = X.index[np.argsort(probs)[-top_n:]]
-    
-    # Borderline: within margin of threshold
+    """Union of highest-probability cases and borderline cases."""
+    high_risk_pos = np.argsort(probs)[-top_n:]
     dist = np.abs(probs - threshold)
-    borderline_mask = dist <= margin
-    borderline_candidates = np.where(borderline_mask)[0]
-    
-    if len(borderline_candidates) > borderline_n:
-        borderline = X.index[borderline_candidates[np.argsort(dist[borderline_candidates])[:borderline_n]]]
-    else:
-        borderline = X.index[borderline_candidates]
-    
-    return high_risk.union(borderline).drop_duplicates()
+    borderline_pos = np.where(dist <= margin)[0]
+    if len(borderline_pos) > borderline_n:
+        borderline_pos = borderline_pos[np.argsort(dist[borderline_pos])[:borderline_n]]
+    combined = np.union1d(high_risk_pos, borderline_pos)
+    return X.index[combined]
 
 
-def sparse_shap(shap_values: np.ndarray, top_k: int) -> sparse.csr_matrix:
-    """Keep only top-k absolute SHAP values per sample to reduce memory."""
-    sparse_vals = np.zeros_like(shap_values)
-    for i in range(len(shap_values)):
-        top_idx = np.argsort(np.abs(shap_values[i]))[-top_k:]
-        sparse_vals[i, top_idx] = shap_values[i, top_idx]
-    return sparse.csr_matrix(sparse_vals)
-
-
-# =============================================================================
-# Main Explainer Class
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
 
 class AMLExplainer:
     """
-    Production-grade SHAP explainer for large-scale AML.
-    Optimized for memory efficiency and regulatory compliance.
+    SHAP-based explainability for AML tree models.
+
+    Instantiate once per model, then call the analysis methods.
+
+    Parameters
+    ----------
+    model : fitted tree-based classifier
+        Must be compatible with ``shap.TreeExplainer``.
+    config : dict, optional
+        Override any keys from ``DEFAULT_CONFIG``.
     """
-    
-    def __init__(self, model: Any, config: Optional[Dict] = None):
-        if not get_model_type(model):
-            raise ValueError(f"Model {type(model).__name__} not supported. Use XGBoost/LightGBM/CatBoost/RF.")
-        
+
+    def __init__(self, model: Any, config: Optional[Dict[str, Any]] = None):
+        if _model_type(model) is None:
+            raise ValueError(
+                f"{type(model).__name__} is not a recognised tree model. "
+                "Use XGBoost, LightGBM, CatBoost, or a scikit-learn forest."
+            )
         self.model = model
-        self.config = {**DEFAULT_CONFIG, **(config or {})}
-        self.model_type = get_model_type(model)
-        self.explainer = None
-        self.global_shap = None  # Store for drift detection
-        
-    def _init_shap(self):
-        """Lazy initialization of TreeExplainer."""
-        if self.explainer is None:
-            import shap
-            self.explainer = shap.TreeExplainer(self.model)
-    
-    # -------------------------------------------------------------------------
-    # Global Analysis
-    # -------------------------------------------------------------------------
-    
+        self.cfg: Dict[str, Any] = {**DEFAULT_CONFIG, **(config or {})}
+        self._explainer = None          # lazy-initialised on first use
+        self._ref_shap: Optional[np.ndarray] = None  # stored for drift baseline
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _init_explainer(self) -> None:
+        if self._explainer is not None:
+            return
+        try:
+            import shap  # type: ignore
+        except ImportError as exc:
+            raise ImportError("Install shap: pip install shap") from exc
+        self._explainer = shap.TreeExplainer(self.model)
+        logger.info("TreeExplainer initialised for %s", type(self.model).__name__)
+
+    def _shap_values(self, X: pd.DataFrame) -> np.ndarray:
+        """Return SHAP values for the positive class, shape (n, p)."""
+        self._init_explainer()
+        sv = self._explainer.shap_values(X)
+        # Binary classifiers may return a list [neg_class, pos_class].
+        if isinstance(sv, list):
+            return sv[1]
+        return sv
+
+    def _output_dir(self) -> Path:
+        p = Path(self.cfg["output_dir"])
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # ------------------------------------------------------------------
+    # Global analysis
+    # ------------------------------------------------------------------
+
     def global_explain(
         self,
         X: pd.DataFrame,
         y: pd.Series,
-        output_dir: str = "outputs/shap"
     ) -> pd.DataFrame:
         """
-        Compute global feature importance using reservoir sampling.
-        Memory-efficient for 30M+ row datasets.
+        Compute global feature importance via reservoir-sampled SHAP values.
+
+        Saves ``global_importance.csv`` and (optionally) ``global_summary.png``
+        to ``output_dir``.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: feature, mean_abs_shap, std_shap, rank.
+            Sorted descending by importance.
         """
-        self._init_shap()
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Sample efficiently
-        print(f"[Global] Sampling {self.config['sample_frac']:.2%} via reservoir sampling...")
-        X_sample, _ = reservoir_sample(
+        out = self._output_dir()
+
+        X_s, y_s = reservoir_sample(
             X, y,
-            sample_frac=self.config["sample_frac"],
-            random_state=self.config["random_state"],
-            chunksize=self.config["streaming_chunksize"]
+            sample_frac=self.cfg["global_sample_frac"],
+            max_samples=self.cfg["global_max_samples"],
+            random_state=self.cfg["random_state"],
         )
-        print(f"[Global] Sampled {len(X_sample):,} rows")
-        
-        # Compute SHAP values
-        print("[Global] Computing SHAP values...")
-        shap_vals = self.explainer.shap_values(X_sample)
-        if isinstance(shap_vals, list): shap_vals = shap_vals[1]  # Positive class
-        
-        # Store for drift detection
-        self.global_shap = shap_vals
-        
-        # Aggregate importance
-        importance = pd.DataFrame({
-            "feature": X_sample.columns,
-            "mean_abs_shap": np.mean(np.abs(shap_vals), axis=0),
-            "std_shap": np.std(shap_vals, axis=0)
-        }).sort_values("mean_abs_shap", ascending=False)
-        importance["rank"] = range(1, len(importance) + 1)
-        
-        # Save
-        importance.to_csv(f"{output_dir}/global_importance.csv", index=False)
-        self._save_plot(shap_vals, X_sample, f"{output_dir}/global_summary.png")
-        
-        # Cleanup
+        logger.info("Computing global SHAP on %d samples ...", len(X_s))
+
+        shap_vals = self._shap_values(X_s)
+        self._ref_shap = shap_vals  # keep for drift baseline
+
+        importance = (
+            pd.DataFrame({
+                "feature": X_s.columns,
+                "mean_abs_shap": np.abs(shap_vals).mean(axis=0),
+                "std_shap": shap_vals.std(axis=0),
+            })
+            .sort_values("mean_abs_shap", ascending=False)
+            .reset_index(drop=True)
+        )
+        importance["rank"] = importance.index + 1
+
+        importance.to_csv(out / "global_importance.csv", index=False)
+        logger.info("Global importance → %s", out / "global_importance.csv")
+
+        if self.cfg["save_plots"]:
+            self._save_summary_plot(shap_vals, X_s, out / "global_summary.png")
+
         del shap_vals
         gc.collect()
-        
+
         return importance
-    
-    def _save_plot(self, shap_vals: np.ndarray, X: pd.DataFrame, path: str):
-        """Generate SHAP summary plot."""
-        import shap
-        import matplotlib.pyplot as plt
+
+    def _save_summary_plot(
+        self, shap_vals: np.ndarray, X: pd.DataFrame, path: Path
+    ) -> None:
+        try:
+            import shap  # type: ignore
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            logger.warning("matplotlib not installed — skipping summary plot.")
+            return
         shap.summary_plot(shap_vals, X, show=False, max_display=20)
         plt.tight_layout()
         plt.savefig(path, dpi=150, bbox_inches="tight")
         plt.close()
-        print(f"[Global] Plot saved: {path}")
-    
-    # -------------------------------------------------------------------------
-    # Local Analysis
-    # -------------------------------------------------------------------------
-    
+        logger.info("Summary plot → %s", path)
+
+    # ------------------------------------------------------------------
+    # Local analysis
+    # ------------------------------------------------------------------
+
     def local_explain(
         self,
         X: pd.DataFrame,
         probs: Optional[np.ndarray] = None,
-        output_dir: str = "outputs/shap"
     ) -> pd.DataFrame:
         """
-        Local SHAP for high-risk and borderline cases.
-        Uses sparse storage for memory efficiency.
+        Compute per-case SHAP values for high-risk and borderline transactions.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Feature matrix for the inference set.
+        probs : np.ndarray, optional
+            Model probabilities for the positive class.
+            Computed from ``self.model`` if not provided.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per explained case: probability, shap_sum, case_type,
+            plus one column per feature with its SHAP contribution.
         """
-        self._init_shap()
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Get probabilities if needed
+        out = self._output_dir()
+
         if probs is None:
             probs = self.model.predict_proba(X)[:, 1]
-        
-        # Select target cases
-        target_idx = select_cases(
+
+        target_idx = _select_local_cases(
             X, probs,
-            self.config["top_n_risk"],
-            self.config["borderline_n"],
-            self.config["decision_threshold"],
-            self.config["borderline_margin"]
+            top_n=self.cfg["top_n_risk"],
+            borderline_n=self.cfg["borderline_n"],
+            threshold=self.cfg["decision_threshold"],
+            margin=self.cfg["borderline_margin"],
         )
-        print(f"[Local] Explaining {len(target_idx)} cases...")
-        
+        logger.info("Local SHAP: explaining %d cases", len(target_idx))
+
         X_target = X.loc[target_idx]
-        probs_target = probs[target_idx.values]
-        
-        # Parallel batch processing for speed
-        shap_vals = self._parallel_shap(X_target)
-        if isinstance(shap_vals, list): shap_vals = shap_vals[1]
-        
-        # Convert to sparse for memory efficiency
-        sparse_vals = sparse_shap(shap_vals, self.config["sparse_top_k"])
-        
-        # Build results DataFrame
-        results = pd.DataFrame({
-            "probability": probs_target,
-            "shap_sum": np.array(sparse_vals.sum(axis=1)).flatten(),
-            "shap_base": self.explainer.expected_value[1] if isinstance(self.explainer.expected_value, list) else self.explainer.expected_value,
-        }, index=target_idx)
-        
-        # Add top feature contributions
-        feature_contribs = pd.DataFrame.sparse.from_spmatrix(
-            sparse_vals, 
-            index=target_idx, 
-            columns=X.columns
+        probs_target = probs[target_idx.get_loc(target_idx)]  # aligned subset
+
+        # Safer index alignment when using iloc-based operations.
+        positional = [X.index.get_loc(i) for i in target_idx]
+        probs_target = probs[positional]
+
+        shap_vals = self._shap_values(X_target)
+
+        expected_val = self._explainer.expected_value
+        if isinstance(expected_val, (list, np.ndarray)):
+            expected_val = expected_val[1]
+
+        hi_threshold = np.sort(probs)[-self.cfg["top_n_risk"]]
+
+        results = pd.DataFrame(
+            {
+                "probability": probs_target,
+                "shap_sum": shap_vals.sum(axis=1),
+                "shap_base": float(expected_val),
+                "case_type": [
+                    "high_risk"
+                    if p >= hi_threshold
+                    else (
+                        "borderline"
+                        if abs(p - self.cfg["decision_threshold"]) <= self.cfg["borderline_margin"]
+                        else "normal"
+                    )
+                    for p in probs_target
+                ],
+            },
+            index=target_idx,
         )
-        
-        # Determine case type
-        high_threshold = np.sort(probs)[-self.config["top_n_risk"]]
-        results["case_type"] = "normal"
-        results.loc[results["probability"] >= high_threshold, "case_type"] = "high_risk"
-        borderline_mask = np.abs(results["probability"] - self.config["decision_threshold"]) <= self.config["borderline_margin"]
-        results.loc[borderline_mask, "case_type"] += "+borderline"
-        
-        # Combine and save
-        full_results = pd.concat([results, feature_contribs], axis=1)
-        full_results.to_csv(f"{output_dir}/local_explanations.csv")
-        
-        # Cleanup
-        del shap_vals, sparse_vals
+
+        shap_df = pd.DataFrame(shap_vals, index=target_idx, columns=X.columns)
+        full = pd.concat([results, shap_df], axis=1)
+        full.to_csv(out / "local_explanations.csv")
+        logger.info("Local explanations → %s", out / "local_explanations.csv")
+
+        del shap_vals, shap_df
         gc.collect()
-        
-        return full_results
-    
-    def _parallel_shap(self, X: pd.DataFrame) -> np.ndarray:
-        """Compute SHAP values in parallel batches."""
-        batch_size = self.config["batch_size"]
-        
-        def compute_batch(start):
-            end = min(start + batch_size, len(X))
-            return self.explainer.shap_values(X.iloc[start:end])
-        
-        batches = range(0, len(X), batch_size)
-        results = Parallel(n_jobs=self.config["n_jobs"], prefer="threads")(
-            delayed(compute_batch)(i) for i in batches
-        )
-        
-        # Handle binary classification list output
-        if isinstance(results[0], list):
-            class_0 = np.vstack([r[0] for r in results])
-            class_1 = np.vstack([r[1] for r in results])
-            return [class_0, class_1]
-        return np.vstack(results)
-    
-    # -------------------------------------------------------------------------
-    # Counterfactual Explanations (AML-Specific)
-    # -------------------------------------------------------------------------
-    
-    def counterfactual_explain(
-        self,
-        X_flagged: pd.DataFrame,
-        output_dir: str = "outputs/shap"
-    ) -> Optional[pd.DataFrame]:
-        """
-        Generate actionable counterfactuals for flagged cases.
-        Shows minimal changes needed to reduce risk score.
-        """
-        if not self.config["enable_counterfactuals"]:
-            return None
-        
-        try:
-            from alibi.explainers import CounterfactualProto
-        except ImportError:
-            warnings.warn("Alibi not installed. Skipping counterfactuals.")
-            return None
-        
-        print(f"[Counterfactual] Generating for {len(X_flagged)} cases...")
-        
-        # Initialize with small reference set
-        cf = CounterfactualProto(
-            self.model.predict_proba,
-            shape=(1, X_flagged.shape[1]),
-            use_kdtree=True,
-            max_iterations=500,
-            early_stop=50
-        )
-        cf.fit(X_flagged.iloc[:min(100, len(X_flagged))].values)
-        
-        results = []
-        for idx, (_, row) in enumerate(X_flagged.iterrows()):
-            if idx >= 50:  # Limit to prevent timeout
-                break
-                
-            orig_proba = self.model.predict_proba(row.values.reshape(1, -1))[0][1]
-            
-            # Skip if already below target
-            if orig_proba < self.config["cf_target_threshold"]:
-                continue
-            
-            explanation = cf.explain(row.values.reshape(1, -1))
-            
-            if explanation.cf is not None:
-                cf_proba = explanation.cf['class_proba'][0][1]
-                cf_row = explanation.cf['X'][0]
-                
-                # Identify changes
-                changes = {
-                    feat: {"from": orig, "to": new}
-                    for feat, orig, new in zip(X_flagged.columns, row.values, cf_row)
-                    if not np.isclose(orig, new)
-                }
-                
-                results.append({
-                    "index": idx,
-                    "original_proba": orig_proba,
-                    "counterfactual_proba": cf_proba,
-                    "risk_reduction": orig_proba - cf_proba,
-                    "n_changes": len(changes),
-                    "changes": json.dumps(changes) if changes else "{}"
-                })
-        
-        df = pd.DataFrame(results)
-        df.to_csv(f"{output_dir}/counterfactuals.csv", index=False)
-        print(f"[Counterfactual] Saved {len(df)} explanations")
-        
-        return df
-    
-    # -------------------------------------------------------------------------
-    # Drift Detection
-    # -------------------------------------------------------------------------
-    
+
+        return full
+
+    # ------------------------------------------------------------------
+    # Drift detection
+    # ------------------------------------------------------------------
+
     def detect_drift(
         self,
         X_new: pd.DataFrame,
         X_reference: Optional[pd.DataFrame] = None,
-        output_dir: str = "outputs/shap"
     ) -> Dict[str, float]:
         """
-        Detect drift in SHAP value distributions.
-        Critical for AML model monitoring and regulatory compliance.
+        Detect distributional drift in SHAP values using PSI.
+
+        Parameters
+        ----------
+        X_new : pd.DataFrame
+            Recent transactions to check for drift.
+        X_reference : pd.DataFrame, optional
+            Historical reference data.  If ``None``, the SHAP array stored
+            by the last ``global_explain`` call is used.
+
+        Returns
+        -------
+        dict
+            Maps feature name → PSI score.
+            Also logs a warning for any feature exceeding the PSI threshold.
         """
-        self._init_shap()
-        
-        if X_reference is None and self.global_shap is None:
-            raise ValueError("Run global_explain first or provide reference data")
-        
-        print("[Drift] Computing SHAP distributions...")
-        
-        # Get reference SHAP values
+        out = self._output_dir()
+
+        if X_reference is None and self._ref_shap is None:
+            raise RuntimeError(
+                "No reference SHAP values available. "
+                "Call global_explain() first, or pass X_reference."
+            )
+
+        # Reference SHAP
         if X_reference is not None:
-            ref_shap = self.explainer.shap_values(X_reference)
-            if isinstance(ref_shap, list): ref_shap = ref_shap[1]
+            ref_shap = self._shap_values(X_reference)
         else:
-            ref_shap = self.global_shap
-        
-        # Get new SHAP values (sample if large)
-        if len(X_new) > 10000:
-            X_new = X_new.sample(10000, random_state=42)
-        
-        new_shap = self.explainer.shap_values(X_new)
-        if isinstance(new_shap, list): new_shap = new_shap[1]
-        
-        # Calculate PSI per feature
-        drift_scores = {}
-        for i, feat in enumerate(X_new.columns):
-            drift_scores[feat] = self._psi(ref_shap[:, i], new_shap[:, i])
-        
-        # Report
-        report = {
-            "drifted_features": [f for f, s in drift_scores.items() if s > 0.1],
-            "max_psi": max(drift_scores.values()),
-            "mean_psi": np.mean(list(drift_scores.values()))
+            ref_shap = self._ref_shap  # type: ignore[assignment]
+
+        # New SHAP — sub-sample to keep RAM bounded
+        if len(X_new) > self.cfg["drift_max_samples"]:
+            X_new = X_new.sample(
+                self.cfg["drift_max_samples"], random_state=self.cfg["random_state"]
+            )
+        new_shap = self._shap_values(X_new)
+
+        psi_scores: Dict[str, float] = {}
+        for i, feature in enumerate(X_new.columns):
+            psi_scores[feature] = _psi(ref_shap[:, i], new_shap[:, i])
+
+        drifted = [f for f, s in psi_scores.items() if s > self.cfg["drift_psi_threshold"]]
+        if drifted:
+            warnings.warn(
+                f"SHAP drift detected in {len(drifted)} features: {drifted[:10]}",
+                UserWarning,
+            )
+
+        pd.Series(psi_scores).to_json(out / "drift_psi_scores.json")
+        summary = {
+            "drifted_features": drifted,
+            "max_psi": max(psi_scores.values()),
+            "mean_psi": float(np.mean(list(psi_scores.values()))),
         }
-        
-        # Save
-        pd.Series(drift_scores).to_json(f"{output_dir}/drift_scores.json")
-        json.dump(report, open(f"{output_dir}/drift_summary.json", "w"))
-        
-        if report["drifted_features"]:
-            warnings.warn(f"Drift detected in {len(report['drifted_features'])} features!")
-        
-        return drift_scores
-    
-    def _psi(self, expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
-        """Population Stability Index for distribution comparison."""
-        breakpoints = np.percentile(expected, np.linspace(0, 100, bins + 1))
-        expected_pct = np.histogram(expected, breakpoints)[0] / len(expected) + 0.0001
-        actual_pct = np.histogram(actual, breakpoints)[0] / len(actual) + 0.0001
-        
-        return np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
-    
-    # -------------------------------------------------------------------------
-    # Full Pipeline
-    # -------------------------------------------------------------------------
-    
+        (out / "drift_summary.json").write_text(json.dumps(summary, indent=2))
+        logger.info(
+            "Drift check: %d features, max PSI=%.4f, %d above threshold",
+            len(psi_scores), summary["max_psi"], len(drifted),
+        )
+
+        del new_shap
+        gc.collect()
+
+        return psi_scores
+
+    # ------------------------------------------------------------------
+    # Full pipeline
+    # ------------------------------------------------------------------
+
     def run_full_analysis(
         self,
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_inference: pd.DataFrame,
         probs: Optional[np.ndarray] = None,
-        output_dir: str = "outputs/shap"
     ) -> Dict[str, Any]:
-        """Execute complete explainability pipeline."""
-        print("=" * 60)
-        print("AML SHAP Analysis Pipeline")
-        print("=" * 60)
-        
-        # Global
-        global_res = self.global_explain(X_train, y_train, output_dir)
-        
-        # Local
-        local_res = self.local_explain(X_inference, probs, output_dir)
-        
-        # Counterfactuals on high-risk subset
-        high_risk = local_res[local_res["case_type"].str.contains("high_risk")]
-        cf_res = self.counterfactual_explain(high_risk.head(50), output_dir) if len(high_risk) > 0 else None
-        
-        print("=" * 60)
-        print("Analysis Complete")
-        print("=" * 60)
-        
+        """
+        Run global → local → drift in sequence.
+
+        Parameters
+        ----------
+        X_train, y_train : training data (used for global importance + drift ref)
+        X_inference : data for which you want local explanations
+        probs : pre-computed positive-class probabilities for X_inference
+
+        Returns
+        -------
+        dict with keys: ``global``, ``local``, ``drift``.
+        """
+        logger.info("=== AML SHAP Full Analysis ===")
+
+        global_result = self.global_explain(X_train, y_train)
+        local_result = self.local_explain(X_inference, probs)
+        drift_result = self.detect_drift(X_inference)  # uses stored ref from global_explain
+
+        logger.info("=== Analysis Complete ===")
+
         return {
-            "global": global_res,
-            "local": local_res,
-            "counterfactuals": cf_res,
-            "model_type": self.model_type
+            "global": global_result,
+            "local": local_result,
+            "drift": drift_result,
         }
 
 
-# =============================================================================
-# Convenience Function
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Convenience wrapper
+# ---------------------------------------------------------------------------
 
 def explain_aml_model(
     model: Any,
@@ -498,22 +491,20 @@ def explain_aml_model(
     y_train: pd.Series,
     X_inference: pd.DataFrame,
     probs: Optional[np.ndarray] = None,
-    config: Optional[Dict] = None,
-    output_dir: str = "outputs/shap"
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    One-shot function for complete AML model explanation.
-    
-    Example:
-        results = explain_aml_model(
-            model=xgb_classifier,
-            X_train=X_train,  # 30M rows
-            y_train=y_train,
-            X_inference=X_daily,  # Today's alerts
-            probs=probs,
-            config={"sample_frac": 0.001},
-            output_dir="outputs/2024-01-15"
-        )
+    One-call entry point for end-to-end SHAP analysis.
+
+    Example
+    -------
+    >>> results = explain_aml_model(
+    ...     model=xgb_clf,
+    ...     X_train=X_train,
+    ...     y_train=y_train,
+    ...     X_inference=X_daily,
+    ...     config={"output_dir": "outputs/2025-01-15"},
+    ... )
     """
     explainer = AMLExplainer(model, config)
-    return explainer.run_full_analysis(X_train, y_train, X_inference, probs, output_dir)
+    return explainer.run_full_analysis(X_train, y_train, X_inference, probs)

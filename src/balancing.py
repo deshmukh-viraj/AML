@@ -1,197 +1,182 @@
-"""Balancing strategies for AML classification.
+"""
+Balancing strategies for AML binary classification.
 
-This module provides lightweight implementations of class imbalance techniques
-suitable for exploration with large financial transaction datasets.
+Responsibility:
+    Transform (X_train, y_train) → (X_balanced, y_balanced, sample_weights)
+    using one of four strategies: none, class_weight, under_sample, smote.
 
-Key design decisions:
-- Memory-aware: prefer index-based slicing over full DataFrame copies
-- Returns (X, y, sample_weights) tuple for uniform interface
-- No in-place mutations of input data
+Design decisions:
+    - Index-based under-sampling: never copies the full DataFrame.
+    - Returns a uniform (X, y, weights | None) tuple so the orchestrator
+      needs no method-specific logic.
+    - SMOTE is gated behind an explicit import check and a loud warning,
+      because it generates synthetic transactions unsuitable for production.
+    - All randomness is seeded for reproducibility.
+
+Dependencies: numpy, pandas, (optional) imbalanced-learn>=0.11
 """
 
+import logging
 import warnings
+from typing import Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Tuple, Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
-def compute_class_weights(y: pd.Series) -> Dict[int, float]:
-    """
-    Compute inverse frequency class weights for binary classification.
-    
-    For AML: rare positive class (laundering) gets higher weight.
-    
-    Args:
-        y: Binary target series (0=legitimate, 1=suspicious)
-        
-    Returns:
-        Dictionary mapping class to weight
-    """
-    n_samples = len(y)
-    classes, counts = np.unique(y, return_counts=True)
-    weights = n_samples / (len(classes) * counts)
-    return dict(zip(classes, weights))
+BalanceResult = Tuple[pd.DataFrame, pd.Series, Optional[np.ndarray]]
 
 
-def apply_class_weights(y: pd.Series) -> np.ndarray:
-    """
-    Apply computed class weights to each sample.
-    
-    Args:
-        y: Binary target series
-        
-    Returns:
-        Array of sample weights matching y length
-    """
-    weights = compute_class_weights(y)
-    return np.array([weights[label] for label in y])
+# Internal helpers
+
+def _class_weights(y: pd.Series) -> dict:
+    """Inverse-frequency weights: {class_label: weight}."""
+    counts = y.value_counts()
+    total = len(y)
+    n_classes = len(counts)
+    return {cls: total / (n_classes * cnt) for cls, cnt in counts.items()}
 
 
-def random_under_sample(
+def _sample_weights_from_class_weights(y: pd.Series) -> np.ndarray:
+    """Map each sample to its class weight."""
+    cw = _class_weights(y)
+    return np.array([cw[label] for label in y], dtype=np.float32)
+
+
+def _random_under_sample(
     X: pd.DataFrame,
     y: pd.Series,
-    ratio: float = 1.0,
-    random_state: int = 42
+    ratio: float,
+    random_state: int,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Random under-sampling of majority class.
-    
-    Memory-efficient: uses index-based selection rather than copying DataFrame.
-    
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        ratio: Ratio of majority to minority samples (1.0 = 1:1 balance)
-        random_state: Reproducibility seed
-        
-    Returns:
-        Tuple of (X_resampled, y_resampled)
+    Under-sample majority class to majority:minority = ratio:1.
+
+    Uses index arithmetic — no DataFrame copy until the final .loc[].
     """
-    np.random.seed(random_state)
-    
-    minority_mask = y == 1
-    majority_mask = y == 0
-    
-    minority_idx = y[minority_mask].index.tolist()
-    majority_idx = y[majority_mask].index.tolist()
-    
-    n_minority = len(minority_idx)
-    n_majority_to_keep = int(n_minority * ratio)
-    
-    sampled_majority = np.random.choice(majority_idx, size=n_majority_to_keep, replace=False)
-    selected_idx = np.concatenate([minority_idx, sampled_majority])
-    
-    # Preserve original order for reproducibility
-    selected_idx = np.sort(selected_idx)
-    
-    return X.loc[selected_idx], y.loc[selected_idx]
+    rng = np.random.default_rng(random_state)
+
+    minority_idx = y.index[y == 1].tolist()
+    majority_idx = y.index[y == 0].tolist()
+
+    n_keep = int(len(minority_idx) * ratio)
+    n_keep = min(n_keep, len(majority_idx))  # Can't keep more than available
+
+    sampled_majority = rng.choice(majority_idx, size=n_keep, replace=False)
+    selected = np.sort(np.concatenate([minority_idx, sampled_majority]))
+
+    logger.info(
+        "Under-sampling: minority=%d, majority kept=%d (ratio=%.1f)",
+        len(minority_idx), n_keep, ratio,
+    )
+    return X.loc[selected], y.loc[selected]
 
 
-def apply_smote(
+def _smote(
     X: pd.DataFrame,
     y: pd.Series,
-    sampling_strategy: float = 1.0,
-    random_state: int = 42,
-    k_neighbors: int = 5
+    sampling_strategy: float,
+    random_state: int,
+    k_neighbors: int,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    SMOTE-style synthetic oversampling (requires imbalanced-learn).
-    
-    WARNING: SMOTE has known issues for AML:
-    - May generate unrealistic synthetic fraud patterns
-    - Memory-intensive for high-dimensional data
-    - Creates data that never existed in production
-    
-    Use only for exploration, never in production.
-    
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        sampling_strategy: Target ratio of minority to majority
-        random_state: Reproducibility seed
-        k_neighbors: Neighbors for interpolation
-        
-    Returns:
-        Tuple of (X_resampled, y_resampled)
+    SMOTE over-sampling via imbalanced-learn.
+
+    WARNING: Synthetic transactions may not reflect real laundering patterns.
+    Use only for offline experimentation, never in a production scoring path.
     """
     warnings.warn(
-        "SMOTE generates synthetic transactions that may not reflect "
-        "real laundering patterns. Use only for exploration, not production.",
-        UserWarning
+        "SMOTE creates synthetic AML transactions that may not reflect real "
+        "laundering behaviour. Use for exploration only — not production.",
+        UserWarning,
+        stacklevel=3,
     )
-    
+
     try:
-        from imblearn.over_sampling import SMOTE
-    except ImportError:
+        from imblearn.over_sampling import SMOTE  # type: ignore
+    except ImportError as exc:
         raise ImportError(
-            "imbalanced-learn required for SMOTE. Install with: pip install imbalanced-learn"
-        )
-    
+            "imbalanced-learn is required for SMOTE.  "
+            "Install it with: pip install imbalanced-learn"
+        ) from exc
+
     smote = SMOTE(
         sampling_strategy=sampling_strategy,
         random_state=random_state,
-        k_neighbors=k_neighbors
+        k_neighbors=k_neighbors,
     )
-    
-    X_array = X.values.astype(np.float32)
-    X_resampled, y_resampled = smote.fit_resample(X_array, y)
-    
-    # Reconstruct DataFrame with original index structure
-    new_index = range(len(y_resampled))
-    X_result = pd.DataFrame(X_resampled, columns=X.columns, index=new_index)
-    y_result = pd.Series(y_resampled, name=y.name, index=new_index)
-    
-    return X_result, y_result
+    X_arr, y_arr = smote.fit_resample(X.values.astype(np.float32), y.values)
+
+    logger.info("SMOTE: %d → %d samples", len(y), len(y_arr))
+
+    new_idx = range(len(y_arr))
+    return (
+        pd.DataFrame(X_arr, columns=X.columns, index=new_idx),
+        pd.Series(y_arr, name=y.name, index=new_idx),
+    )
+
+
+
+VALID_METHODS = frozenset({"none", "class_weight", "under_sample", "smote"})
 
 
 def balance_data(
     X: pd.DataFrame,
     y: pd.Series,
     method: str = "none",
-    **kwargs
-) -> Tuple[pd.DataFrame, pd.Series, Optional[np.ndarray]]:
+    *,
+    random_state: int = 42,
+    under_sample_ratio: float = 1.0,
+    smote_sampling_strategy: float = 1.0,
+    smote_k_neighbors: int = 5,
+) -> BalanceResult:
     """
-    Unified interface for all balancing methods.
-    
-    Args:
-        X: Feature DataFrame
-        y: Target series
-        method: Balancing strategy ('none', 'class_weight', 'under_sample', 'smote')
-        **kwargs: Additional arguments passed to specific methods
-        
-    Returns:
-        Tuple of (X_transformed, y_transformed, sample_weights)
-        - sample_weights is None unless method='class_weight'
+    Unified entry-point for class-imbalance handling.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Feature matrix (will not be mutated).
+    y : pd.Series
+        Binary target (0 = legitimate, 1 = suspicious).
+    method : str
+        One of ``"none"``, ``"class_weight"``, ``"under_sample"``, ``"smote"``.
+    random_state : int
+        Seed for reproducibility.
+    under_sample_ratio : float
+        Majority-to-minority ratio for under-sampling (1.0 = balanced 1:1).
+    smote_sampling_strategy : float
+        Target minority fraction for SMOTE.
+    smote_k_neighbors : int
+        k for SMOTE interpolation.
+
+    Returns
+    -------
+    (X_out, y_out, sample_weights)
+        ``sample_weights`` is an ndarray only for ``"class_weight"``; else ``None``.
     """
-    random_state = kwargs.get("random_state", 42)
-    
+    if method not in VALID_METHODS:
+        raise ValueError(
+            f"Unknown balancing method {method!r}. Choose from {sorted(VALID_METHODS)}."
+        )
+
+    pos_rate = y.mean()
+    logger.info("balance_data: method=%s, n=%d, positive_rate=%.4f", method, len(y), pos_rate)
+
     if method == "none":
-        # Baseline: no transformation
         return X, y, None
-    
-    elif method == "class_weight":
-        # Cost-sensitive learning: compute weights without resampling
-        # Memory-efficient: no data duplication
-        weights = apply_class_weights(y)
+
+    if method == "class_weight":
+        weights = _sample_weights_from_class_weights(y)
+        logger.info("class_weight: weights=%s", _class_weights(y))
         return X, y, weights
-    
-    elif method == "under_sample":
-        # Reduce majority class to match minority
-        ratio = kwargs.get("ratio", 1.0)
-        X_balanced, y_balanced = random_under_sample(
-            X, y, ratio=ratio, random_state=random_state
-        )
-        return X_balanced, y_balanced, None
-    
-    elif method == "smote":
-        # Synthetic oversampling (with warnings)
-        X_balanced, y_balanced = apply_smote(
-            X, y,
-            sampling_strategy=kwargs.get("sampling_strategy", 1.0),
-            random_state=random_state,
-            k_neighbors=kwargs.get("k_neighbors", 5)
-        )
-        return X_balanced, y_balanced, None
-    
-    else:
-        raise ValueError(f"Unknown balancing method: {method}")
+
+    if method == "under_sample":
+        X_bal, y_bal = _random_under_sample(X, y, under_sample_ratio, random_state)
+        return X_bal, y_bal, None
+
+    # method == "smote"
+    X_bal, y_bal = _smote(X, y, smote_sampling_strategy, random_state, smote_k_neighbors)
+    return X_bal, y_bal, None

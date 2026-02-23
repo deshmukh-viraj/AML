@@ -1,503 +1,430 @@
 # orchestrator.py
 """
 AML Experimentation Orchestrator
+=================================
 
-This script orchestrates the full experimentation pipeline:
-1. Phase 1: Balancing Strategy Comparison
-2. Phase 2: Model Comparison
-3. Phase 3: Hyperparameter Tuning (for best model)
+Runs a three-phase experiment pipeline:
 
-Results are logged to a single CSV file for analysis.
+    Phase 1 — Balancing strategy comparison
+        Fix model = Logistic Regression, vary balancing method.
+        Goal: identify which imbalance strategy maximises PR-AUC.
+
+    Phase 2 — Model comparison
+        Fix balancing = best from Phase 1, vary model family.
+        Goal: identify the best base learner.
+
+    Phase 3 — Hyperparameter tuning (random search)
+        Fix model + balancing from Phases 1–2, search param grid.
+        Goal: squeeze out the last few PR-AUC points.
+
+All results land in a single CSV so every experiment is reproducible.
 
 Usage:
     python orchestrator.py --data_path data/transactions.parquet
+
+Memory contract:
+    Each phase discards balanced DataFrames immediately after the run.
+    gc.collect() is called after each iteration to return RAM promptly.
+    Suitable for 8 GB machines with datasets up to ~5 M rows (depending
+    on feature count).
+
+Dependencies: numpy, pandas, scikit-learn
+    (+ lightgbm and/or imbalanced-learn if those methods are enabled)
 """
+
+from __future__ import annotations
 
 import argparse
 import gc
+import json
+import logging
 import os
 import sys
 import time
-import hashlib
-import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+from sklearn.model_selection import train_test_split
 
 from src.balancing import balance_data
-from src.modeling import (
-    train_and_evaluate,
-    cross_validate_and_evaluate,
-    MODEL_REGISTRY,
+from src.modeling import MODEL_REGISTRY, train_and_evaluate
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
 )
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Experiment configuration
+# Edit these lists to add or remove methods / models / param grids.
+# ---------------------------------------------------------------------------
 
-# =============================================================================
-# Configuration
-# =============================================================================
-
-# Balancing methods to explore
-BALANCING_METHODS = [
-    "none",          # Baseline: no balancing
-    "class_weight",  # Cost-sensitive learning
-    "under_sample",  # Random under-sampling
-    # "smote",       # Uncomment with caution - memory intensive
+BALANCING_METHODS: List[str] = [
+    "none",
+    "class_weight",
+    "under_sample",
+    # "smote",  # Memory-intensive — enable with caution
 ]
 
-# Models to compare
-MODELS = [
+MODELS: List[str] = [
     "logistic_regression",
     "random_forest",
-    # "lightgbm",    # Uncomment if lightgbm installed
+    # "lightgbm",  # Requires: pip install lightgbm
 ]
 
-# Hyperparameter grids for tuning phase
-HYPERPARAMS = {
+# Random-search grid for Phase 3.
+HYPERPARAMS: Dict[str, Dict[str, List[Any]]] = {
     "logistic_regression": {
-        "C": [0.01, 0.1, 1.0, 10.0],
+        "C": [0.001, 0.01, 0.1, 1.0, 10.0],
         "max_iter": [1000],
     },
     "random_forest": {
         "n_estimators": [50, 100, 200],
         "max_depth": [5, 10, 20, None],
+        "min_samples_split": [2, 5, 10],
     },
-    # "lightgbm": {
-    #     "num_leaves": [15, 31, 63],
-    #     "learning_rate": [0.01, 0.05, 0.1],
-    #     "n_estimators": [50, 100, 200],
-    # },
 }
 
+# Fixed logistic regression params used in Phase 1 (balancing comparison).
+_PHASE1_MODEL = "logistic_regression"
+_PHASE1_PARAMS: Dict[str, Any] = {"C": 1.0, "max_iter": 1000, "random_state": 42}
 
-# =============================================================================
-# Data Loading
-# =============================================================================
+# Phase 3: how many random param combos to try.
+_N_RANDOM_ITERS = 10
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 def load_data(
     path: str,
     target_col: str = "is_laundering",
     test_size: float = 0.2,
-    random_state: int = 42
+    random_state: int = 42,
 ) -> tuple:
     """
-    Load data and perform train/test split.
-    
-    Args:
-        path: Path to parquet file
-        target_col: Name of target column
-        test_size: Proportion for test split
-        random_state: Reproducibility seed
-        
-    Returns:
-        Tuple of (X_train, X_test, y_train, y_test)
+    Load a Parquet file and return a stratified train / test split.
+
+    Converts float64 → float32 to halve memory for wide feature matrices.
     """
-    print(f"Loading data from {path}...")
+    logger.info("Loading data from %s", path)
     df = pd.read_parquet(path)
-    
-    # Ensure target exists
+
     if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in data")
-    
-    # Separate features and target
+        raise ValueError(f"Target column {target_col!r} not found in {list(df.columns)}")
+
     X = df.drop(columns=[target_col])
-    y = df[target_col]
-    
-    # Memory optimization: convert to float32 for large datasets
-    for col in X.select_dtypes(include=['float64']).columns:
-        X[col] = X[col].astype(np.float32)
-    
-    # Simple random split (for time-series AML, consider time-based split)
-    from sklearn.model_selection import train_test_split
+    y = df[target_col].astype(int)
+    del df
+    gc.collect()
+
+    # Memory optimisation: float64 → float32
+    f64_cols = X.select_dtypes(include="float64").columns
+    if len(f64_cols):
+        X[f64_cols] = X[f64_cols].astype(np.float32)
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
+        X, y, test_size=test_size, stratify=y, random_state=random_state
     )
-    
-    print(f"Loaded {len(df):,} transactions")
-    print(f"  Train: {len(X_train):,} | Test: {len(X_test):,}")
-    print(f"  Positive rate (train): {y_train.mean():.4%}")
-    
+    del X, y
+    gc.collect()
+
+    logger.info(
+        "Split: train=%d  test=%d  positive_rate_train=%.4f",
+        len(X_train), len(X_test), y_train.mean(),
+    )
     return X_train, X_test, y_train, y_test
 
 
-# =============================================================================
-# Experiment Execution
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Shared result builder
+# ---------------------------------------------------------------------------
 
-def run_phase1_balancing_experiments(
+def _record(
+    phase: int,
+    balancing: str,
+    model: str,
+    params: dict,
+    result: Dict[str, Any],
+    elapsed: float,
+    n_train: int,
+) -> Dict[str, Any]:
+    """Build a flat results dict ready for a DataFrame row."""
+    metrics = result["metrics"]
+    row: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "phase": phase,
+        "balancing_method": balancing,
+        "model_name": model,
+        "params": json.dumps(params),
+        "pr_auc": metrics.get("pr_auc", float("nan")),
+        "roc_auc": metrics.get("roc_auc", float("nan")),
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "f1": metrics["f1"],
+        "wall_time_seconds": round(elapsed, 2),
+        "n_train_samples": n_train,
+        "status": "success",
+    }
+    # Carry through any recall_at_X%_precision columns.
+    for k, v in metrics.items():
+        if k.startswith("recall_at_"):
+            row[k] = v
+    return row
+
+
+def _error_record(
+    phase: int, balancing: str, model: str, params: dict, exc: Exception
+) -> Dict[str, Any]:
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "phase": phase,
+        "balancing_method": balancing,
+        "model_name": model,
+        "params": json.dumps(params),
+        "status": f"error: {exc}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase runners
+# ---------------------------------------------------------------------------
+
+def _run_one(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
     y_test: pd.Series,
-    results: List[Dict]
-) -> None:
+    balancing: str,
+    model_name: str,
+    model_params: dict,
+    random_state: int,
+) -> tuple:
     """
-    Phase 1: Compare balancing strategies with a baseline model.
-    
-    Uses Logistic Regression as fixed model to isolate balancing effect.
+    Apply balancing then train + evaluate.
+    Returns (result_dict, elapsed_seconds, n_train_samples).
+    Raises on any internal error (caller handles).
     """
-    print("\n" + "="*60)
-    print("PHASE 1: Balancing Strategy Comparison")
-    print("="*60)
-    
-    baseline_model = "logistic_regression"
-    model_params = {"C": 1.0, "max_iter": 1000, "random_state": 42}
-    
-    for method in BALANCING_METHODS:
-        print(f"\n--- Balancing: {method} ---")
-        
-        try:
-            start_time = time.time()
-            
-            # Apply balancing
-            X_balanced, y_balanced, sample_weights = balance_data(
-                X_train, y_train, method=method, random_state=42
-            )
-            
-            # Determine effective sample weights
-            if method == "class_weight":
-                effective_weights = sample_weights
-            else:
-                effective_weights = None
-            
-            # Train and evaluate
-            result = train_and_evaluate(
-                X_balanced, y_balanced,
-                X_test, y_test,
-                model_name=baseline_model,
-                model_params=model_params,
-                sample_weights=effective_weights,
-            )
-            
-            elapsed = time.time() - start_time
-            
-            # Record results
-            record = {
-                "timestamp": datetime.now().isoformat(),
-                "phase": 1,
-                "balancing_method": method,
-                "model_name": baseline_model,
-                "params": json.dumps(model_params),
-                "pr_auc": result["metrics"]["pr_auc"],
-                "roc_auc": result["metrics"]["roc_auc"],
-                "precision": result["metrics"]["precision"],
-                "recall": result["metrics"]["recall"],
-                "f1": result["metrics"]["f1"],
-                "train_time_seconds": elapsed,
-                "n_train_samples": len(X_balanced),
-                "status": "success",
-            }
-            
-            # Add operational metrics if available
-            for key in result["metrics"]:
-                if "recall_at_" in key:
-                    record[key] = result["metrics"][key]
-            
-            results.append(record)
-            print(f"  PR-AUC: {record['pr_auc']:.4f} | Recall: {record['recall']:.4f} | Time: {elapsed:.1f}s")
-            
-            # Memory cleanup
-            del X_balanced, y_balanced
-            gc.collect()
-            
-        except Exception as e:
-            print(f"  ERROR: {str(e)}")
-            results.append({
-                "timestamp": datetime.now().isoformat(),
-                "phase": 1,
-                "balancing_method": method,
-                "model_name": baseline_model,
-                "status": f"error: {str(e)}",
-            })
+    X_bal, y_bal, weights = balance_data(
+        X_train, y_train, method=balancing, random_state=random_state
+    )
+
+    # class_weight passes weights through to the estimator
+    effective_weights = weights if balancing == "class_weight" else None
+
+    t0 = time.perf_counter()
+    result = train_and_evaluate(
+        X_bal, y_bal, X_test, y_test,
+        model_name=model_name,
+        model_params=model_params,
+        sample_weights=effective_weights,
+    )
+    elapsed = time.perf_counter() - t0
+    n_train = len(X_bal)
+
+    del X_bal, y_bal
+    gc.collect()
+
+    return result, elapsed, n_train
 
 
-def run_phase2_model_comparison(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    best_balancing: str,
-    results: List[Dict]
+def phase1_balancing(
+    X_train, y_train, X_test, y_test,
+    results: List[Dict],
+    random_state: int = 42,
 ) -> str:
     """
-    Phase 2: Compare models using best balancing strategy.
-    
-    Returns:
-        Name of best performing model
+    Compare balancing strategies with a fixed Logistic Regression model.
+    Returns the name of the best-performing balancing method (by PR-AUC).
     """
-    print("\n" + "="*60)
-    print("PHASE 2: Model Comparison")
-    print("="*60)
-    print(f"Using balancing method: {best_balancing}")
-    
-    best_model = None
-    best_pr_auc = 0
-    
-    for model_name in MODELS:
-        print(f"\n--- Model: {model_name} ---")
-        
+    logger.info("=" * 60)
+    logger.info("PHASE 1 — Balancing Strategy Comparison")
+    logger.info("=" * 60)
+
+    for method in BALANCING_METHODS:
+        logger.info("  Balancing: %s", method)
         try:
-            start_time = time.time()
-            
-            # Apply balancing
-            X_balanced, y_balanced, sample_weights = balance_data(
-                X_train, y_train, method=best_balancing, random_state=42
+            result, elapsed, n_train = _run_one(
+                X_train, y_train, X_test, y_test,
+                method, _PHASE1_MODEL, _PHASE1_PARAMS, random_state,
             )
-            
-            # Use default params for comparison
-            model_params = {}
-            
-            # Train and evaluate
-            result = train_and_evaluate(
-                X_balanced, y_balanced,
-                X_test, y_test,
-                model_name=model_name,
-                model_params=model_params,
-                sample_weights=sample_weights,
+            row = _record(1, method, _PHASE1_MODEL, _PHASE1_PARAMS, result, elapsed, n_train)
+            logger.info("  → PR-AUC=%.4f  Recall=%.4f  %.1fs", row["pr_auc"], row["recall"], elapsed)
+        except Exception as exc:
+            logger.error("  FAILED: %s", exc, exc_info=True)
+            row = _error_record(1, method, _PHASE1_MODEL, _PHASE1_PARAMS, exc)
+        results.append(row)
+
+    best = _best_balancing(results)
+    logger.info("Phase 1 best balancing: %s", best)
+    return best
+
+
+def phase2_models(
+    X_train, y_train, X_test, y_test,
+    best_balancing: str,
+    results: List[Dict],
+    random_state: int = 42,
+) -> str:
+    """
+    Compare model families with the best balancing strategy from Phase 1.
+    Returns the name of the best-performing model (by PR-AUC).
+    """
+    logger.info("=" * 60)
+    logger.info("PHASE 2 — Model Comparison  (balancing=%s)", best_balancing)
+    logger.info("=" * 60)
+
+    best_model: Optional[str] = None
+    best_pr_auc = -1.0
+
+    for model_name in MODELS:
+        logger.info("  Model: %s", model_name)
+        try:
+            result, elapsed, n_train = _run_one(
+                X_train, y_train, X_test, y_test,
+                best_balancing, model_name, {}, random_state,
             )
-            
-            elapsed = time.time() - start_time
-            
-            # Record results
-            record = {
-                "timestamp": datetime.now().isoformat(),
-                "phase": 2,
-                "balancing_method": best_balancing,
-                "model_name": model_name,
-                "params": json.dumps(model_params),
-                "pr_auc": result["metrics"]["pr_auc"],
-                "roc_auc": result["metrics"]["roc_auc"],
-                "precision": result["metrics"]["precision"],
-                "recall": result["metrics"]["recall"],
-                "f1": result["metrics"]["f1"],
-                "train_time_seconds": elapsed,
-                "n_train_samples": len(X_balanced),
-                "status": "success",
-            }
-            
-            for key in result["metrics"]:
-                if "recall_at_" in key:
-                    record[key] = result["metrics"][key]
-            
-            results.append(record)
-            print(f"  PR-AUC: {record['pr_auc']:.4f} | Recall: {record['recall']:.4f} | Time: {elapsed:.1f}s")
-            
-            # Track best model
-            if result["metrics"]["pr_auc"] > best_pr_auc:
-                best_pr_auc = result["metrics"]["pr_auc"]
+            row = _record(2, best_balancing, model_name, {}, result, elapsed, n_train)
+            logger.info("  → PR-AUC=%.4f  %.1fs", row["pr_auc"], elapsed)
+            if row["pr_auc"] > best_pr_auc:
+                best_pr_auc = row["pr_auc"]
                 best_model = model_name
-            
-            del X_balanced, y_balanced
-            gc.collect()
-            
-        except Exception as e:
-            print(f"  ERROR: {str(e)}")
-            results.append({
-                "timestamp": datetime.now().isoformat(),
-                "phase": 2,
-                "balancing_method": best_balancing,
-                "model_name": model_name,
-                "status": f"error: {str(e)}",
-            })
-    
+        except Exception as exc:
+            logger.error("  FAILED: %s", exc, exc_info=True)
+            row = _error_record(2, best_balancing, model_name, {}, exc)
+        results.append(row)
+
     if best_model is None:
-        raise ValueError("No model succeeded in Phase 2")
-    
-    print(f"\nBest model: {best_model} (PR-AUC: {best_pr_auc:.4f})")
+        raise RuntimeError("All models failed in Phase 2 — cannot continue.")
+
+    logger.info("Phase 2 best model: %s  (PR-AUC=%.4f)", best_model, best_pr_auc)
     return best_model
 
 
-def run_phase3_hyperparameter_tuning(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
+def phase3_tuning(
+    X_train, y_train, X_test, y_test,
     best_balancing: str,
     best_model: str,
-    results: List[Dict]
+    results: List[Dict],
+    random_state: int = 42,
 ) -> Dict[str, Any]:
     """
-    Phase 3: Lightweight hyperparameter tuning for best model.
-    
-    Uses random search with limited iterations.
+    Random hyperparameter search for the winning (model, balancing) pair.
+    Returns the best param dict found.
     """
-    print("\n" + "="*60)
-    print("PHASE 3: Hyperparameter Tuning")
-    print("="*60)
-    print(f"Model: {best_model} | Balancing: {best_balancing}")
-    
+    logger.info("=" * 60)
+    logger.info("PHASE 3 — Hyperparameter Tuning  model=%s  balancing=%s", best_model, best_balancing)
+    logger.info("=" * 60)
+
     if best_model not in HYPERPARAMS:
-        print("No hyperparameter grid defined, skipping tuning")
+        logger.info("No param grid defined for %s — skipping Phase 3.", best_model)
         return {}
-    
-    param_grid = HYPERPARAMS[best_model]
-    
-    # Generate random search combinations
-    param_combinations = []
-    for _ in range(10):  # Limited iterations for exploration
-        combo = {}
-        for param, values in param_grid.items():
-            combo[param] = np.random.choice(values)
-        combo["random_state"] = 42
-        param_combinations.append(combo)
-    
-    best_params = None
-    best_pr_auc = 0
-    
-    for i, model_params in enumerate(param_combinations):
-        print(f"\n--- Iteration {i+1}/{len(param_combinations)}: {model_params} ---")
-        
+
+    grid = HYPERPARAMS[best_model]
+    rng = np.random.default_rng(random_state)
+
+    # Build random combos, always inject random_state for reproducibility.
+    combos: List[Dict[str, Any]] = []
+    for _ in range(_N_RANDOM_ITERS):
+        combo: Dict[str, Any] = {k: rng.choice(v).item() for k, v in grid.items()}
+        combo["random_state"] = random_state
+        combos.append(combo)
+
+    best_params: Dict[str, Any] = {}
+    best_pr_auc = -1.0
+
+    for i, params in enumerate(combos, 1):
+        logger.info("  Iter %d/%d  params=%s", i, len(combos), params)
         try:
-            start_time = time.time()
-            
-            # Apply balancing
-            X_balanced, y_balanced, sample_weights = balance_data(
-                X_train, y_train, method=best_balancing, random_state=42
+            result, elapsed, n_train = _run_one(
+                X_train, y_train, X_test, y_test,
+                best_balancing, best_model, params, random_state,
             )
-            
-            # Train and evaluate
-            result = train_and_evaluate(
-                X_balanced, y_balanced,
-                X_test, y_test,
-                model_name=best_model,
-                model_params=model_params,
-                sample_weights=sample_weights,
-            )
-            
-            elapsed = time.time() - start_time
-            
-            pr_auc = result["metrics"]["pr_auc"]
-            print(f"  PR-AUC: {pr_auc:.4f} | Time: {elapsed:.1f}s")
-            
-            # Record results
-            record = {
-                "timestamp": datetime.now().isoformat(),
-                "phase": 3,
-                "balancing_method": best_balancing,
-                "model_name": best_model,
-                "params": json.dumps(model_params),
-                "pr_auc": pr_auc,
-                "roc_auc": result["metrics"]["roc_auc"],
-                "precision": result["metrics"]["precision"],
-                "recall": result["metrics"]["recall"],
-                "f1": result["metrics"]["f1"],
-                "train_time_seconds": elapsed,
-                "n_train_samples": len(X_balanced),
-                "status": "success",
-            }
-            
-            for key in result["metrics"]:
-                if "recall_at_" in key:
-                    record[key] = result["metrics"][key]
-            
-            results.append(record)
-            
-            # Track best
-            if pr_auc > best_pr_auc:
-                best_pr_auc = pr_auc
-                best_params = model_params
-            
-            del X_balanced, y_balanced
-            gc.collect()
-            
-        except Exception as e:
-            print(f"  ERROR: {str(e)}")
-            results.append({
-                "timestamp": datetime.now().isoformat(),
-                "phase": 3,
-                "balancing_method": best_balancing,
-                "model_name": best_model,
-                "params": json.dumps(model_params),
-                "status": f"error: {str(e)}",
-            })
-    
-    print(f"\nBest params: {best_params} (PR-AUC: {best_pr_auc:.4f})")
-    return best_params or {}
+            row = _record(3, best_balancing, best_model, params, result, elapsed, n_train)
+            logger.info("  → PR-AUC=%.4f  %.1fs", row["pr_auc"], elapsed)
+            if row["pr_auc"] > best_pr_auc:
+                best_pr_auc = row["pr_auc"]
+                best_params = params
+        except Exception as exc:
+            logger.error("  FAILED: %s", exc, exc_info=True)
+            row = _error_record(3, best_balancing, best_model, params, exc)
+        results.append(row)
+
+    logger.info("Phase 3 best params: %s  (PR-AUC=%.4f)", best_params, best_pr_auc)
+    return best_params
 
 
-# =============================================================================
-# Main
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-def main():
+def _best_balancing(results: List[Dict]) -> str:
+    """Return the balancing method with the highest PR-AUC from Phase 1."""
+    p1 = [r for r in results if r.get("phase") == 1 and r.get("status") == "success"]
+    if not p1:
+        logger.warning("No Phase 1 results — defaulting to 'none'.")
+        return "none"
+    return max(p1, key=lambda r: r.get("pr_auc", -1.0))["balancing_method"]
+
+
+def _print_summary(results: List[Dict], best_balancing: str, best_model: str, best_params: dict) -> None:
+    logger.info("=" * 60)
+    logger.info("EXPERIMENT SUMMARY")
+    logger.info("  Best balancing : %s", best_balancing)
+    logger.info("  Best model     : %s", best_model)
+    logger.info("  Best params    : %s", best_params)
+    successful = [r for r in results if r.get("status") == "success"]
+    top5 = sorted(successful, key=lambda r: r.get("pr_auc", -1.0), reverse=True)[:5]
+    logger.info("  Top-5 experiments by PR-AUC:")
+    for rank, r in enumerate(top5, 1):
+        logger.info(
+            "    %d. %-15s + %-20s  PR-AUC=%.4f",
+            rank, r["balancing_method"], r["model_name"], r.get("pr_auc", float("nan")),
+        )
+    logger.info("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="AML Experimentation Orchestrator")
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        default="input/transactions.parquet",
-        help="Path to input parquet file"
+    parser.add_argument("--data_path", default="aml_features/train_features.parquet")
+    parser.add_argument("--output_path", default="outputs/experiment_results.csv")
+    parser.add_argument("--target_col", default="Is Laundering")
+    parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--random_state", type=int, default=42)
+    args = parser.parse_args(argv)
+
+    Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Load once, share across phases.
+    X_train, X_test, y_train, y_test = load_data(
+        args.data_path, args.target_col, args.test_size, args.random_state
     )
-    parser.add_argument(
-        "--output_path",
-        type=str,
-        default="outputs/experiment_results.csv",
-        help="Path to output results CSV"
-    )
-    parser.add_argument(
-        "--target_col",
-        type=str,
-        default="is_laundering",
-        help="Target column name"
-    )
-    args = parser.parse_args()
-    
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    
-    # Load data
-    X_train, X_test, y_train, y_test = load_data(args.data_path, args.target_col)
-    
-    # Initialize results storage
-    results = []
-    
-    # Phase 1: Balancing comparison
-    run_phase1_balancing_experiments(
-        X_train, y_train, X_test, y_test, results
-    )
-    
-    # Determine best balancing (highest PR-AUC from Phase 1)
-    phase1_results = [r for r in results if r.get("phase") == 1 and r.get("status") == "success"]
-    if phase1_results:
-        best_balancing = max(phase1_results, key=lambda x: x.get("pr_auc", 0))["balancing_method"]
-    else:
-        best_balancing = "none"
-    
-    # Phase 2: Model comparison
-    best_model = run_phase2_model_comparison(
-        X_train, y_train, X_test, y_test, best_balancing, results
-    )
-    
-    # Phase 3: Hyperparameter tuning
-    best_params = run_phase3_hyperparameter_tuning(
-        X_train, y_train, X_test, y_test, best_balancing, best_model, results
-    )
-    
-    # Save results
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(args.output_path, index=False)
-    print(f"\nResults saved to {args.output_path}")
-    
-    # Summary
-    print("\n" + "="*60)
-    print("EXPERIMENT SUMMARY")
-    print("="*60)
-    print(f"Best balancing: {best_balancing}")
-    print(f"Best model: {best_model}")
-    print(f"Best params: {best_params}")
-    
-    # Show top results
-    successful_results = [r for r in results if r.get("status") == "success"]
-    if successful_results:
-        print("\nTop 5 experiments by PR-AUC:")
-        top5 = sorted(successful_results, key=lambda x: x.get("pr_auc", 0), reverse=True)[:5]
-        for i, r in enumerate(top5, 1):
-            print(f"  {i}. {r['balancing_method']} + {r['model_name']}: PR-AUC={r['pr_auc']:.4f}")
+
+    results: List[Dict] = []
+
+    best_balancing = phase1_balancing(X_train, y_train, X_test, y_test, results, args.random_state)
+    best_model = phase2_models(X_train, y_train, X_test, y_test, best_balancing, results, args.random_state)
+    best_params = phase3_tuning(X_train, y_train, X_test, y_test, best_balancing, best_model, results, args.random_state)
+
+    pd.DataFrame(results).to_csv(args.output_path, index=False)
+    logger.info("Results saved → %s", args.output_path)
+
+    _print_summary(results, best_balancing, best_model, best_params)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

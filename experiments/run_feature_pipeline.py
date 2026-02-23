@@ -10,9 +10,7 @@ This script orchestrates feature generation only by calling
 - Does NOT perform model training or anomaly detection
 
 Usage:
-    python experiments/run_feature_pipeline.py --trans-path data/raw/HI-Medium_Trans.csv \
-        --accounts-path data/raw/HI-Medium_accounts.csv \
-        --output-dir aml_features --sample 0.1
+    python experiments/run_feature_pipeline.py
 """
 
 from pathlib import Path
