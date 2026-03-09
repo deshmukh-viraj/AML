@@ -62,7 +62,8 @@ def process_spilts_in_batches(
     entity_stats_lazy: Optional[pl.LazyFrame],
     output_dir: Path, 
     batch_size: int = 10000,
-    toxic_corridors=None
+    toxic_corridors=None,
+    train_df: pl.LazyFrame = None
 ) -> Path:
 
     logger.info(f"BATCH PROCESSING: {split_name.upper()}")
@@ -100,6 +101,15 @@ def process_spilts_in_batches(
         # 1. Sort for rolling features
         logger.info("   Step 1: Sorting(maintained through pipeline)...")
         df_batch = df_batch.sort(['Account_HASHED', 'Timestamp'])
+
+        #prepend train histrory for val/test
+        if split_name in ('val', 'test') and train_df is not None:
+            train_batch=(train_df.filter(pl.col('Account_HASHED').is_in(batch_acc))
+            .sort(['Account_HASHED', 'Timestamp'])
+            .with_columns(pl.lit('__history__').alias('__split__')))
+
+            df_batch = df_batch.with_columns(pl.lit(split_name).alias('__split__'))
+            df_batch = pl.concat([train_batch, df_batch]).sort(['Account_HASHED', 'Timestamp'])
         
         # 2. Base features
         logger.info("   Step 2: Base features...")
@@ -139,6 +149,13 @@ def process_spilts_in_batches(
         logger.info("   Step 8: Toxic corridor features...")
         df_batch = apply_toxic_corridor_features(df_batch, toxic_corridors=toxic_corridors)
         
+        #drop train history 
+        if split_name in ('val', 'test') and train_df is not None:
+            df_batch = df_batch.filter(pl.col('__split__') != '__history__').drop('__split__')
+        else:
+            if '__split__' in df_batch.columns:
+                df_batch = df_batch.drop('__split__')
+                
         # Collect this batch
         logger.info(f"   Collecting batch {batch_idx+1} (streaming)...")
         df_batch_collected = df_batch.collect(engine='streaming')
@@ -368,7 +385,6 @@ def build_all_features(
     transactions_path: Path,
     accounts_path: Path,
     output_dir: Path = Path('./aml_features'),
-    compute_anomaly_scores: bool = False,
     sample_fraction: Optional[float] = None
 ) -> Tuple[Path, Path, Path]:
     """
