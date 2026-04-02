@@ -26,6 +26,8 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import auc, precision_recall_curve, roc_auc_score, roc_curve
 from xgboost import XGBClassifier
 import lightgbm as lgb
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression as LR
 
 import shap
 import mlflow
@@ -106,6 +108,8 @@ def load_data(split: str, features: List[str], max_rows: int = None) -> Tuple[np
         raise FileNotFoundError(f"Can't find {path} - run anomaly detection file first")
     
     cols_to_load = features + [TARGET_COL]
+    if TIME_COL:
+        cols_to_load = list(set(cols_to_load + [TIME_COL]))
     
     #first, just count rows without loading data
     n_rows = pl.scan_parquet(path).select(pl.len()).collect().item()
@@ -143,6 +147,7 @@ def load_data(split: str, features: List[str], max_rows: int = None) -> Tuple[np
 
     logger.info(f" Size in RAM: {df.estimated_size() / 1024**2:.1f} MB")
 
+    timestamps = df[TIME_COL].cast(pl.Int64).to_numpy() if TIME_COL in df.columns else None
     y= df[TARGET_COL].to_numpy().astype(np.int32)
     X = df.select(features).to_numpy().astype(np.float32)
 
@@ -169,7 +174,7 @@ def load_data(split: str, features: List[str], max_rows: int = None) -> Tuple[np
         logger.warning(f"{split}: only {n_fraud} fraud cases - metrics may be unstable")
 
     logger.info(f"{split}: {len(y):,} rows | fraud={n_fraud:,} | legit={len(y)-n_fraud:,}")
-    return X, y
+    return X, y, timestamps
 
 
 #metrics
@@ -201,35 +206,62 @@ def calculate_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float
         "threshold_1pct_fpr": float(thresholds[idx]) if idx < len(thresholds) else 1.0,
     }
 
-def stratified_split(y: np.ndarray, train_frac: float, rng:np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    sample positives and negatives independently at train_frac
-    """
-    pos = np.where(y==1)[0]
-    neg = np.where(y==0)[0]
+# def stratified_split(y: np.ndarray, train_frac: float, rng:np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
+#     """
+#     sample positives and negatives independently at train_frac
+#     """
+#     pos = np.where(y==1)[0]
+#     neg = np.where(y==0)[0]
 
-    train_pos = rng.choice(pos, max(int(train_frac * len(pos)), 1), replace=False)
-    train_neg = rng.choice(neg, max(int(train_frac * len(neg)), 1), replace=False)
+#     train_pos = rng.choice(pos, max(int(train_frac * len(pos)), 1), replace=False)
+#     train_neg = rng.choice(neg, max(int(train_frac * len(neg)), 1), replace=False)
 
-    train_idx = np.concatenate([train_pos, train_neg])
-    val_idx = np.setdiff1d(np.arange(len(y)), train_idx)
+#     train_idx = np.concatenate([train_pos, train_neg])
+#     val_idx = np.setdiff1d(np.arange(len(y)), train_idx)
+#     return train_idx, val_idx
+
+def temporal_mccv_split(timestamps: np.ndarray, fold_i: int, n_folds: int=5,) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    expanding walk forward split each fold trains on earlier time, validates on the immeditely following window.
+    """
+    sorted_idx = np.argsort(timestamps)
+    n= len(sorted_idx)
+
+    #larger validation set to catch temporal drift
+    val_size = int(0.1*n)
+    
+    train_end = n -(n_folds * val_size)
+    if train_end <= 0:
+        raise ValueError(f"Not enough data for {n_folds} folds with val fraction")
+    
+    train_end = train_end + fold_i * val_size
+    val_start = train_end
+    val_end = val_start + val_size
+    train_idx = sorted_idx[:train_end]
+    val_idx = sorted_idx[val_start:val_end]
     return train_idx, val_idx
 
 
-def mccv_evaluate(config: dict, X: np.ndarray, y: np.ndarray) -> Dict:
+def mccv_evaluate(config: dict, X: np.ndarray, y: np.ndarray, timestamps: np.ndarray) -> Dict:
     """
     monte carlo cross validation for extreme imbalance
     Problem with k-fold: Fixed splits can have validation folds with 
     0-2 positive cases, making metrics unstable.
     """
     scores, thresholds = [], []
-    logger.info(f" Running {MCCV_ITERATIONS} MCCV folds...")
+    logger.info(f" Running {MCCV_ITERATIONS} expanding walk forward folds...")
 
     for i in range(MCCV_ITERATIONS):
-        rng = np.random.RandomState(RANDOM_STATE + i)
-        train_idx, val_idx = stratified_split(y, train_frac=0.8, rng=rng)
+        train_idx, val_idx = temporal_mccv_split(timestamps, fold_i=i, n_folds=MCCV_ITERATIONS)
 
-        if y[train_idx].sum() < MIN_FRAUD_WARN or y[val_idx].sum() < MIN_FRAUD_WARN:
+        n_train_fraud = int(y[train_idx].sum())
+        n_val_fraud = int(y[val_idx].sum())
+
+        logger.info(
+        f"Fold {i}: train={len(train_idx):,} rows ({n_train_fraud} fraud) | "
+        f"val={len(val_idx):,} rows ({n_val_fraud} fraud)"
+        )
+        if n_train_fraud < MIN_FRAUD_WARN or n_val_fraud < MIN_FRAUD_WARN:
             logger.warning(f" Fold {i}: too few fraud cases - skipping")
             continue
         try:
@@ -424,6 +456,24 @@ def check_calibration(y_true: np.ndarray, y_prob: np.ndarray, model_name: str) -
     return cal_error
 
 
+def calibration_model(model, X_cal, y_cal):
+    """
+    calibrate the model using Platt scaling.
+    """
+    raw_scores = model.predict_proba(X_cal)[:,1].reshape(-1,1)
+    platt = LR()
+    platt.fit(raw_scores, y_cal)
+    logger.info("Platt scaling calibrated model")
+    return platt
+
+def calibrated_predict(model, platt, X):
+    """
+    predict probabilities using calibrated model.
+    """
+    raw_scores = model.predict_proba(X)[:,1].reshape(-1,1)
+    return platt.predict_proba(raw_scores)[:,1]
+
+
 def evaluate_fusion(y: np.ndarray, model_probs: np.ndarray, anomaly_scores: np.ndarray,
                     high: float, low: float, anomaly_thresh: float) -> Dict:
     """flag a transaction if model is very confident, or moderately confident + anomaly flag."""
@@ -453,7 +503,6 @@ def evaluate_fusion(y: np.ndarray, model_probs: np.ndarray, anomaly_scores: np.n
         "low_threshold": low,
         "anomaly_threshold": anomaly_thresh,
     }
-
 
 
 def run_fusion(y_cal, probs_cal, anomaly_cal, y_eval, probs_eval, anomaly_eval) -> Dict:
@@ -496,14 +545,13 @@ def run_fusion(y_cal, probs_cal, anomaly_cal, y_eval, probs_eval, anomaly_eval) 
     return fusion_eval
 
 
-    
 def explain_model(model, X_sample, features, model_name):
     """generate SHAP plots to understand what features matter."""
     
     logger.info(f"Creating SHAP plots for {model_name}...")
     
     try:
-        act_model = model.named_steps['clf'] if hasattr(model, 'named_stage') else model
+        act_model = model.named_steps['clf'] if hasattr(model, 'named_steps') else model
         X_input = model.named_steps['scaler'].transform(X_sample) if hasattr(model, 'named_steps') else X_sample
         explainer = shap.TreeExplainer(act_model)
         shap_values = explainer.shap_values(X_input)
@@ -606,13 +654,12 @@ def log_results(results: List[Dict], best_name: str, fusion: Dict, cal_error: fl
         logger.warning(f"MLflow logging failed: {e}")
 
 
-
 def print_results(results: List[Dict], fusion: Dict, best_name: str):
     """Print a nice summary table."""
     print("\n" + "="*80)
     print("RESULTS")
     print("="*80)
-    print(f"{'Model':<20} {'Conservative': > 14} {'Mean Recall':>12} {'Std':>10} {'Val PR-AUC':>12} {'Valid Folds':>11}")
+    print(f"{'Model':<20} {'Conservative':>14} {'Mean Recall':>12} {'Std':>10} {'Val PR-AUC':>12} {'Valid Folds':>11}")
     print("-"*80)
     
     # Sort by MCCV mean recall
@@ -629,7 +676,6 @@ def print_results(results: List[Dict], fusion: Dict, best_name: str):
     print("="*80 + "\n")
 
 
-
 def main():
     logger.info("Starting AML supervised training pipeline")
     setup()
@@ -637,8 +683,8 @@ def main():
     train_file = INPUT_DIR / "train_features.parquet"
     features = get_features(pl.scan_parquet(train_file).schema)
 
-    X_train, y_train = load_data("train", features, max_rows=TRAIN_SAMPLE_SIZE)
-    X_val, y_val = load_data("val", features, max_rows=VAL_SAMPLE_SIZE)
+    X_train, y_train, train_timestamps = load_data('train', features, max_rows=TRAIN_SAMPLE_SIZE)
+    X_val, y_val, _ = load_data("val", features, max_rows=VAL_SAMPLE_SIZE)
 
     n_fraud = int(y_train.sum())
     imbalance_ratio = (len(y_train) - n_fraud) / max(n_fraud, 1)
@@ -653,7 +699,7 @@ def main():
     has_anomaly = 'anomaly_score' in features
     if has_anomaly:
         a_idx = features.index('anomaly_score')
-        anomaly_cal = X_cal[:,  a_idx].copy()
+        anomaly_cal = X_cal[:,a_idx].copy()
         anomaly_eval = X_eval[:, a_idx].copy()
 
     #mccv model selection
@@ -667,7 +713,7 @@ def main():
     for name, config in model_configs.items():
         try:
             logger.info(f"Evaluating {name}...")
-            mccv = mccv_evaluate(config, X_train, y_train)
+            mccv = mccv_evaluate(config, X_train, y_train, train_timestamps)
             mccv_results[name] = mccv
             all_results.append({"name": name, "mccv": mccv, "val_metrics": None})
             score = mccv["mean_recall"] - 2 * mccv["std_recall"]
@@ -692,7 +738,8 @@ def main():
     final_model, val_metrics, probs_eval = train_model(
         best_config, X_train, y_train, X_eval, y_eval
     )
-
+    platt = calibration_model(final_model, X_cal, y_cal)
+    probs_eval = calibrated_predict(final_model, platt, X_eval)
     check_mccv_val_alignment(best_mccv, val_metrics, best_name)
 
     # calibration on validation data — not test data — to keep test fully clean
@@ -724,8 +771,8 @@ def main():
     logger.info("Test Evaluation")
     logger.info("=" * 60)
 
-    X_test, y_test = load_data("test", features, max_rows=TEST_SAMPLE_SIZE)
-    test_probs = final_model.predict_proba(X_test)[:, 1]
+    X_test, y_test, _ = load_data("test", features, max_rows=TEST_SAMPLE_SIZE)
+    test_probs = calibrated_predict(final_model, platt, X_test)
     test_metrics = calculate_metrics(y_test, test_probs)
 
     logger.info(f"Test recall@1%FPR: {test_metrics['recall_at_1pct_fpr']:.4f} | "
@@ -742,6 +789,7 @@ def main():
     with open(model_path, "wb") as f:
         pickle.dump({
             "model":final_model,
+            "platt": platt,
             "features": features,
             "imbalance_ratio": imbalance_ratio,
             "mccv_results": best_mccv,
