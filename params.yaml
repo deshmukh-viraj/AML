@@ -1,0 +1,67 @@
+data_ingestion:
+  trans_local_path: "data/raw/HI-Medium_Trans.csv"
+  acc_local_path: "data/raw/HI-Medium_accounts.csv"
+  
+  # S3 config — credentials loaded from .env
+  s3_bucket: "your-aml-bucket-name"
+  region_name: "us-east-1"
+  transactions_s3_key: "raw/HI-Medium_Trans.csv"
+  accounts_s3_key: "raw/HI-Medium_accounts.csv"
+
+
+data_preprocessing:
+  dtype_map:
+  "From Bank": "str"
+  "To Bank": "str"
+  "Amount Paid": "float32"
+  "Amount Received": "float32"
+  "Is Laundering": "int32"
+
+
+feature_engineering:
+  train_days_end: 11
+  val_days_start: 12
+  val_days_end: 13
+  test_days_start: 14
+  test_days_end: 16
+  toxic_corridor_threshold: 0.02
+  toxic_corridor_min_txns: 100
+
+
+anomaly_scoring:
+  train_sample_size: 2500000
+  chunk_size: 100000
+  contamination: "auto"
+  random_state: 42
+
+
+model:
+  random_state: 42
+  train_sample_size: 1500000
+  val_sample_size: 500000
+  test_sample_size: 750000
+  fpr_threshold: 0.01
+  mccv_iterations: 5
+  variance_threshold: 0.001
+  shap_threshold: 0.001
+
+model_registry:
+  reg_model_name: "aml detector"
+  dataset_name: "IBM_HI_Medium"
+  min_improvement: 0.005
+
+dagshub:
+  repo_owner: "virajdeshmukh080818"
+  repo_name: "AML"
+
+mlflow:
+  experiment_name: "AML pipeline"
+
+  
+storage:
+  features_dir: "aml_features"
+  raw_data_dir: "data/raw"
+  processed_dir: "data/processed"
+  anomaly_dir: "data/processed_with_anomaly"
+  model_dir: "models/supervised"
+  reports_dir: "reporsts"
