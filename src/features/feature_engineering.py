@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 try:
     from src.features.build_features import build_all_features
-    from src.features.experimental.toxic_corridors import derive_toxic_corridors
 except ImportError as e:
     logger.error(f"AML feature module not found: {e}")
 
@@ -28,7 +27,7 @@ def load_params(params_path: str = 'params.yaml') -> dict:
     try:
         with open(params_path, 'r') as f:
             params = yaml.safe_load(f)
-        logger.info(f"Parameters loaded from {params_path}")
+        logger.info(f"parameters loaded from {params_path}")
         return params
     except FileNotFoundError:
         logger.error(f"params.yaml not found at {params_path}")
@@ -36,7 +35,7 @@ def load_params(params_path: str = 'params.yaml') -> dict:
 
 
 #load preprocessed data
-def load_clean_data(params:dict) -> tuple[pl.DataFrame, pl.DataFrame]:
+def load_clean_data(params:dict) -> tuple[pl.LazyFrame, pl.LazyFrame]:
     """
     load clean parquet files from preprocessing stage
     transactions loaded as lazyframe - build_features.py
@@ -55,28 +54,31 @@ def load_clean_data(params:dict) -> tuple[pl.DataFrame, pl.DataFrame]:
     transactions = pl.scan_parquet(trans_path)
     accounts = pl.scan_parquet(acc_path)
     n_rows = transactions.select(pl.len()).collect().item()
+    acc_rows = accounts.select(pl.len()).collect().item()
     logger.info(f"Transactions (lazy): {n_rows:,} ros")
-    logger.info(f"Accounts (eager): {len(accounts):,} rows")
+    logger.info(f"Accounts (lazy): {acc_rows:,} rows")
 
     return transactions, accounts
 
 
 #feature engineering
-def run_feature_engg(transactions: pl.LazyFrame, accounts: pl.DataFrame, params: dict, output_dir: Path) -> tuple[Path, Path, Path]:
+def run_feature_engg(transactions: pl.LazyFrame, accounts: pl.LazyFrame, params: dict, output_dir: Path) -> tuple[Path, Path, Path]:
     """
     orchestrates the full AML feature engineering pipeline.
     calls build_all_features() from the validated exploration phase
     """
     logger.info('Starting AML feature engineering pipeline...')
-    output_dir.mkdir(parents=True, exit_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    processed_dir = Path(params['storage']['processed_dir'])
+    trans_path = processed_dir / 'transactions_processed.parquet'
+    acc_path = processed_dir / 'accounts_processed.parquet'
 
     #build_alll_features 
     train_path, val_path, test_path = build_all_features(
-        transactions_path=None, 
-        accounts_path=None,
+        transactions_path=trans_path, 
+        accounts_path=acc_path,
         output_dir=output_dir,
-        trans_lazy=transactions,
-        acc_df = accounts,
     )
     logger.info(f"Train features -> {train_path}")
     logger.info(f"Val feature -> {val_path}")
