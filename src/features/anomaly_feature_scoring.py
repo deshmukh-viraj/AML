@@ -83,7 +83,7 @@ def compute_train_medians(features_dir: Path, feature_cols: List[str], target_co
 
 def clean_chunk(chunk_df: pl.DataFrame, feature_cols: List[str], medians: np.ndarray) -> np.ndarray:
     """convert chunk to numpy array with imputation."""
-    X = chunk_df.select(feature_cols).to_numpy().astype(np.float32)
+    X = chunk_df.select([pl.col(c).cast(pl.Float32) for c in feature_cols]).to_numpy()
     X[~np.isfinite(X)] = np.nan
     
     #column wise imputation using pre computed medians
@@ -101,32 +101,27 @@ def train_anomaly_model(features_dir: Path, feature_cols: List[str],
     path = features_dir / "train_features.parquet"
     
     # Load legit rows only
-    legit_df = (
-        pl.scan_parquet(path)
-        .select(feature_cols + [target_col])
-        .filter(pl.col(target_col) == 0)
-        .select(feature_cols)
-        .collect()
+    n_legit = (pl.scan_parquet(path).filter(
+        pl.col(target_col) == 0).select(pl.len()).collect().item()
     )
-    
-    n_legit = len(legit_df)
     sample_size = min(TRAIN_SAMPLE_SIZE, n_legit)
     
     #random sample for training
-    rng = np.random.default_rng(RANDOM_STATE)
-    row_indices = sorted(rng.choice(n_legit, size=sample_size, replace=False).tolist())
-    train_sample = legit_df[row_indices]
+    train_sample = (
+        pl.scan_parquet(path).filter(pl.col(target_col) == 0).select(feature_cols).collect()
+        .sample(n=sample_size, seed=RANDOM_STATE, shuffle=True)
+    )
     
     logger.info(f"Training sample: {sample_size:,} rows x {len(feature_cols)} features")
     
     X_train = clean_chunk(train_sample, feature_cols, medians)
     
-    del legit_df, train_sample
+    del train_sample
     gc.collect()
     
     model = IsolationForest(
         n_estimators=200,
-        max_samples=10_050,
+        max_samples=min(10_050, sample_size),
         contamination=CONTAMINATION,
         max_features=1.0,
         bootstrap=False,
@@ -210,8 +205,8 @@ def main():
         target_col = params["data_ingestion"].get("target_col", "Is Laundering")
         
         features_dir = Path(params["storage"]["features_dir"])
-        output_dir = Path(params["storage"].get("anomaly_features_dir", "data/processed_with_anomaly"))
-        model_dir = Path(params["storage"].get("model_dir", "models"))
+        output_dir = Path(params["storage"]["anomaly_dir"])
+        model_dir = Path(params["storage"]["model_dir"])
         
         output_dir.mkdir(parents=True, exist_ok=True)
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -234,7 +229,7 @@ def main():
         model = train_anomaly_model(features_dir, feature_cols, medians, target_col)
         
         #save model artifact
-        model_path = model_dir / "anomaly_detector.pkl"
+        model_path = model_dir / "isolation_forest.pkl"
         with open(model_path, "wb") as f:
             pickle.dump({
                 "model": model,
