@@ -122,7 +122,7 @@ def load_split(
 
     timestamps = df[time_col].cast(pl.Int64).to_numpy() if time_col in df.columns else None
     y = df[target_col].to_numpy().astype(np.int32)
-    X = df.select(features).to_numpy().astype(np.float32)
+    X = df.select([pl.col(c).cast(pl.Float32) for c in features]).to_numpy()
 
     del df
     gc.collect()
@@ -508,9 +508,9 @@ def main():
         time_col= params["data_ingestion"].get("timestamp_col", "Timestamp")
  
         features_dir = Path(params["storage"].get("anomaly_dir", params['storage']['features_dir']))
-        model_dir = Path(params["storage"]["model_dir"])
+        model_dir = Path(params["storage"]["model_build_dir"])
         shap_dir = model_dir / "shap"
-        reports_dir= Path(params["storage"].get("reports_dir", "reports"))
+        reports_dir= Path(params["storage"]["reports_dir"])
  
         model_dir.mkdir(parents=True, exist_ok=True)
         shap_dir.mkdir(parents=True, exist_ok=True)
@@ -545,7 +545,18 @@ def main():
  
         # variance filter  same mask applied to both train and val
         variances = np.var(X_train, axis=0)
-        variance_mask = variances > 0.001
+        protected_feat = {
+            'Payment Format_target_enc', 'Receiving Currency_target_enc', 'Payment Currency_target_enc',
+            'is_toxic_corridor', 'flag_heavy_structuring', 'prev_was_sender'
+        }
+        variance_mask = []
+        for f, var in zip(features, variances):
+            if f in protected_feat:
+                variance_mask.append(True)
+            else:
+                variance_mask.append(var > 0.001)
+        
+        variance_mask = np.array(variance_mask)
         removed_feats = [f for f, keep in zip(features, variance_mask) if not keep]
         if removed_feats:
             logger.warning(f"Removed {len(removed_feats)} low-variance features: {removed_feats}")
@@ -647,7 +658,15 @@ def main():
         X_test= X_test[:, variance_mask] if X_test.shape[1] > len(features) else X_test
         test_probs = calibrated_predict(final_model, platt, X_test)
         test_metrics = calculate_metrics(y_test, test_probs, fpr_threshold)
- 
+
+        #save model predictions for threshold tunuing
+        artifacts_dir = model_dir / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+
+        np.save(artifacts_dir / "y_true.npy", y_test)
+        np.save(artifacts_dir / "y_prob.npy", test_probs)
+
+        logger.info(f"Saved predictions to {artifacts_dir}")
         logger.info(
             f"Test — Recall@1%FPR: {test_metrics['recall_at_1pct_fpr']:.4f} | "
             f"PR-AUC: {test_metrics['pr_auc']:.4f} | "
@@ -701,7 +720,7 @@ def main():
             "n_features": len(features),
         }
  
-        metrics_path = reports_dir / "metrics.json"
+        metrics_path = reports_dir / "model_metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(all_metrics, f, indent=4)
         logger.info(f"Metrics saved -> {metrics_path}")
