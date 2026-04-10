@@ -1,5 +1,4 @@
 import os
-from fsspec import transaction
 import polars as pl
 import yaml
 import logging
@@ -9,7 +8,6 @@ from typing import Dict, Optional, Any, List
 
 load_dotenv()
 
-from src.features.build_features import trans_path
 from src.logger import logging
 logging.basicConfig(level=logging.INFO)
 
@@ -33,7 +31,7 @@ def load_params(params_path: str='params.yaml') -> Dict[str, Any]:
         return {}
 
 
-def load_raw_data(params: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
+def load_raw_data(params: dict) -> tuple[pl.LazyFrame, pl.LazyFrame]:
     """
     load raw parquet files saved by data_ingestion stage.
     """
@@ -46,19 +44,19 @@ def load_raw_data(params: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
             raise FileNotFoundError(f" Raw data not found at {p}")
 
     
-    transactions = pl.read_parquet(trans_path)
-    accounts = pl.read_parquet(acc_path)
+    transactions = pl.scan_parquet(trans_path)
+    accounts = pl.scan_parquet(acc_path)
 
-    logger.info(f"Loaded trasactions: {len(transactions)} rows | {len(transactions.columns)} cols")
-    logger.info(f"Loaded accounts: {len(accounts)} rows | {len(accounts.columns)} cols")
+    logger.info(f"Scanning Transactions from {trans_path} (lazy)")
+    logger.info(f"Scanning Accounts from {acc_path} (lazy)")
 
     return transactions, accounts
 
 
 #cleaning
-def clean_cols_names(df: pl.DataFrame, name: str) -> pl.DataFrame:
+def clean_cols_names(df: pl.LazyFrame, name: str) -> pl.LazyFrame:
     """strip trailing/leading whitespaces from the columns names"""
-    cleaned = {col: col.strip() for col in df.columns}
+    cleaned = {col: col.strip() for col in df.collect_schema().names()}
     df = df.rename(cleaned)
     changed = {k: v for k, v in cleaned.items() if k != v}
     if changed:
@@ -68,34 +66,33 @@ def clean_cols_names(df: pl.DataFrame, name: str) -> pl.DataFrame:
     return df
 
 
-def parse_timestamp(df: pl.DataFrame, timestamp_col: str) -> pl.DataFrame:
+def parse_timestamp(df: pl.LazyFrame, timestamp_col: str) -> pl.LazyFrame:
     
-    if timestamp_col not in df.columns:
+    if timestamp_col not in df.collect_schema().names():
         logger.warning(f"Timestamp column '{timestamp_col}' not found, skipping parsing")
         return df
     
-    dtype = df[timestamp_col].dtype
-    if dtype in (pl.Date, pl.Datetime):
+    schema = df.collect_schema()
+    dtype = schema[timestamp_col]
+    if isinstance(dtype, (pl.Date, pl.Datetime)):
         logger.info(f"Timestamp colums '{timestamp_col}' already parsed: {dtype}")
         return df
 
-
-def remove_duplicates(df: pl.DataFrame, name: str) -> pl.DataFrame:
-    
-    before = len(df)
-    df = df.unique()
-    after = len(df)
-    removed = before - after
-
-    if removed > 0:
-        logger.warning(f"{name}: removed {removed:,} exact duplicates rows")
-    else:
-        logger.info(f"{name}: No duplicates rows found")
-
+    df = df.with_columns(
+        pl.col(timestamp_col).str.to_datetime(strict=False).alias(timestamp_col)
+    )
+    logger.info(f"Parsed '{timestamp_col}' to Datetime")
     return df
 
 
-def cast_dtypes(df: pl.DataFrame, params: dict) -> pl.DataFrame:
+def remove_duplicates(df: pl.LazyFrame, name: str) -> pl.LazyFrame:
+    
+    df = df.unique(maintain_order=False)
+    logger.info(f"{name}: unique() applied (lazy)")
+    return df
+
+
+def cast_dtypes(df: pl.LazyFrame, params: dict) -> pl.LazyFrame:
     """
     cast cols to correct dtypes as defined in params.yaml
     """
@@ -125,7 +122,7 @@ def cast_dtypes(df: pl.DataFrame, params: dict) -> pl.DataFrame:
             logger.warning(f"Unknown dtype {dtype_str} for column {col}, skipping")
             continue
 
-        casts.append(pl.col(col).cast(pl.type).alias(col))
+        casts.append(pl.col(col).cast(pl_type).alias(col))
         logger.info(f"Cast {col} -> {dtype_str}")
 
     if casts:
@@ -133,7 +130,7 @@ def cast_dtypes(df: pl.DataFrame, params: dict) -> pl.DataFrame:
     return df
 
 
-def preprocess_transactions(df: pl.DataFrame, params: dict) -> pl.DataFrame:
+def preprocess_transactions(df: pl.LazyFrame, params: dict) -> pl.LazyFrame:
     """transactions preprocessing"""
 
     timestamp_col = params['data_ingestion'].get('timestamp_col', 'Timestamp')
@@ -145,7 +142,7 @@ def preprocess_transactions(df: pl.DataFrame, params: dict) -> pl.DataFrame:
     return df
 
 
-def preprocess_accounts(df: pl.DataFrame, params:dict) -> pl.DataFrame:
+def preprocess_accounts(df: pl.LazyFrame, params:dict) -> pl.LazyFrame:
     """accounts preprocessing"""
 
     logger.info("----Preprocessing Accounts----")
@@ -155,7 +152,7 @@ def preprocess_accounts(df: pl.DataFrame, params:dict) -> pl.DataFrame:
     return df
 
 
-def save_preprocessed_data(transacctions: pl.DataFrame, accounts: pl.DataFrame, params:dict) -> tuple[Path, Path]:
+def save_preprocessed_data(transacctions: pl.LazyFrame, accounts: pl.LazyFrame, params:dict) -> tuple[Path, Path]:
     """saved cleaned parquet files for feature engineering stage"""
 
     processed_dir = Path(params['storage']['processed_dir'])
@@ -164,11 +161,14 @@ def save_preprocessed_data(transacctions: pl.DataFrame, accounts: pl.DataFrame, 
     trans_path = processed_dir / 'transactions_processed.parquet'
     acc_path = processed_dir / 'accounts_processed.parquet'
 
-    transacctions.write_parquet(trans_path, compression='snappy')
-    accounts.write_parquet(acc_path, compression='snappy')
-
+    logger.info("Streaming transactions to disk...")
+    transacctions.sink_parquet(trans_path, compression='snappy')
     logger.info(f"Transactions -> {trans_path}")
-    logger.info(f"Accounts -> ({acc_path})")
+
+    logger.info("Streaming accounts to disk...")
+    accounts.sink_parquet(acc_path, compression='snappy')
+    logger.info(f"Accounts -> {acc_path}")
+ 
 
     return trans_path, acc_path
 
