@@ -1,4 +1,3 @@
-from fileinput import fileno
 import os
 import json
 import pickle
@@ -8,6 +7,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import mlflow
+import mlflow.xgboost
+import mlflow.sklearn
 from mlflow import MlflowClient
 
 load_dotenv()
@@ -60,7 +61,7 @@ def setup_mlflow(params: dict) -> MlflowClient:
 
 #load experiment info
 def load_experiment_info(reports_dir: Path) ->dict:
-    exp_info_path = reports_dir / 'experiments_info.json'
+    exp_info_path = reports_dir / 'experiment_info.json'
     if not exp_info_path.exists():
         raise FileNotFoundError(f"experiment_info.json not found at {exp_info_path}")
 
@@ -162,13 +163,23 @@ def register_model(
     returns registered model version number.
     """
     logger.info(f"Registering model '{registered_model_name}'...")
- 
-    #create model version from the logged artifact
+    
     model_uri = f"runs:/{run_id}/model"
-    model_version = mlflow.register_model(model_uri, registered_model_name)
- 
+    logger.info("Waiting for dagshub artifact indexing..")
+    try:
+        client.create_registered_model(registered_model_name)
+    except Exception:
+        pass
+
+    model_version = client.create_model_version(
+        name=registered_model_name,
+        source=model_uri, 
+        run_id=run_id)
+    
+
     logger.info(f"Registered: {registered_model_name} v{model_version.version}")
- 
+    return model_version.version
+    
     #tag with full metric audit trail
     tags = {
         "model_type":model_name,
@@ -248,7 +259,7 @@ def save_registry_output(
 # main
 def main():
     logger.info("=" * 60)
-    logger.info("AML Pipeline — Stage 6: Model Registry")
+    logger.info(" Stage 6: Model Registry")
     logger.info("=" * 60)
  
     try:
@@ -256,9 +267,7 @@ def main():
         reports_dir = Path(params["storage"].get("reports_dir", "reports"))
         reports_dir.mkdir(parents=True, exist_ok=True)
  
-        registered_model_name = params.get("model_registry", {}).get(
-            "registered_model_name", "AML_Laundering_Detector"
-        )
+        registered_model_name = params.get("model_registry", {}).get("reg_model_name")
  
         #load experiment info from evaluation stage
         new_info = load_experiment_info(reports_dir)
