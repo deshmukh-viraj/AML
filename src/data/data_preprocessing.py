@@ -161,11 +161,11 @@ def save_preprocessed_data(transacctions: pl.LazyFrame, accounts: pl.LazyFrame, 
     trans_path = processed_dir / 'transactions_processed.parquet'
     acc_path = processed_dir / 'accounts_processed.parquet'
 
-    logger.info("Streaming transactions to disk...")
+    logger.info("streaming transactions to disk...")
     transacctions.sink_parquet(trans_path, compression='snappy')
     logger.info(f"Transactions -> {trans_path}")
 
-    logger.info("Streaming accounts to disk...")
+    logger.info("streaming accounts to disk...")
     accounts.sink_parquet(acc_path, compression='snappy')
     logger.info(f"Accounts -> {acc_path}")
  
