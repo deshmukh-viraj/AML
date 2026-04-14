@@ -94,3 +94,7 @@ ecvenv
 notebooks/aml_features/
 aml_features/
 cred.txt/
+local_s3/
+dvc_data/
+models/
+reports/

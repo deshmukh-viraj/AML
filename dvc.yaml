@@ -116,7 +116,7 @@ stages:
     deps:
       - src/model/model_registry.py
       - reports/experiment_info.json
-      - reports/metrics.json
+      - reports/model_metrics.json
       - params.yaml
     params:
       - model_registry
