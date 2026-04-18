@@ -26,7 +26,7 @@ jobs:
 
       - name: Pull Data from DagsHub
         env:
-          DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
         run: |
           # Configure DVC remote to use basic auth with your token
           dvc remote modify myremote auth basic
