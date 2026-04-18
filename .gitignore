@@ -98,3 +98,5 @@ local_s3/
 dvc_data/
 models/
 reports/
+mlruns/
+cred.txt/

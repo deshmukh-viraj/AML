@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AML Copilot Triage Dashboard</title>
+    <style>
+        :root {
+            --bg-dark: #0f172a; --bg-card: #1e293b; --text-main: #f8fafc; --text-muted: #94a3b8;
+            --accent-fraud: #dc2626; --accent-investigate: #f59e0b; --accent-safe: #16a34a;
+            --border-color: #334155;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; }
+        body { background-color: var(--bg-dark); color: var(--text-main); padding: 20px; font-size: 13px; }
+        
+        .dashboard-grid { display: grid; grid-template-columns: 1fr 340px; gap: 20px; max-width: 1200px; margin: 0 auto; }
+        
+        .sidebar { display: flex; flex-direction: column; gap: 15px; }
+        .card { background: var(--bg-card); padding: 18px; border: 1px solid var(--border-color); border-radius: 8px; }
+        .card-title { font-size: 12px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em; margin-bottom: 12px; }
+        
+        .kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+        .kpi-item { background: var(--bg-dark); padding: 15px; border-radius: 6px; text-align: center; }
+        .kpi-value { font-size: 24px; font-weight: 700; }
+
+        .kpi-label { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+        
+        .input-label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; display: block; }
+        textarea { width: 100%; height: 120px; background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-color); border-radius: 6px; font-family: 'Fira Code', monospace; font-size: 11px; resize: vertical; padding: 8px; }
+        button { width: 100%; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; color: white; transition: background-color 0.2s; }
+        .btn-predict { background-color: #3b82f6; }
+        .btn-predict:hover { background-color: #2563eb; }
+        .btn-investigate { background-color: #f59e0b; color: #000; display: none; }
+        .btn-investigate:hover { background-color: #d97706; }
+        
+        .result-box { margin-top: 15px; padding: 15px; border-radius: 6px; display: none; font-size: 12px; }
+        .alert-dismissed { background: var(--bg-card); border-left: 4px solid var(--accent-safe); color: var(--text-main); }
+        .alert-investigate { background: var(--bg-card); border-left: 4px solid var(--accent-investigate); color: var(--text-main); }
+        .alert-emergency { background: var(--bg-card); border-left: 4px solid var(--accent-fraud); color: var(--text-main); }
+        
+        .content { display: flex; flex-direction: column; gap: 20px; }
+        
+        .queue-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; overflow: hidden; }
+        .queue-header { padding: 12px 15px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; }
+        .queue-header span { font-size: 12px; color: var(--text-muted); }
+        
+        table { width: 100%; border-collapse: collapse; }
+        th { padding: 10px 15px; text-align: left; font-size: 11px; color: var(--text-muted); border-bottom: 1px solid var(--border-color); }
+        td { padding: 12px 15px; border-bottom: 1px solid var(--border-color); }
+        tr:hover { background: rgba(255, 255, 255, 0.03); }
+        
+        .tag { font-size: 9px; padding: 2px 6px; border-radius: 3px; font-weight: 700; text-transform: uppercase; }
+        .tag-urgent { background: var(--accent-fraud); color: white; }
+        .tag-pending { background: var(--accent-investigate); color: #000; }
+       
+        .tag-safe { background: var(--accent-safe); color: white; }
+        
+        .ai-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; padding: 20px; display: none; }
+        .ai-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; color: var(--text-main); display: flex; align-items: center; gap: 8px; }
+        .shap-list { list-style-type: none; padding: 0; }
+        .shap-item { padding: 10px 12px; background: var(--bg-dark); border: 1px solid var(--border-color); border-radius: 4px; display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 12px; align-items: center; }
+        .shap-pos { border-left: 3px solid var(--accent-fraud); }
+        .shap-neg { border-left: 3px solid var(--accent-safe); }
+        .shap-amount { color: var(--text-muted); }
+        .shap-val { font-weight: 600; white-space: nowrap; }
+        .shap-desc { flex-grow: 1; margin: 0 10px; }
+
+        .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; margin-right: 6px; vertical-align: middle; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="dashboard-grid">
+        <!-- LEFT: Sidebar -->
+        <div class="sidebar">
+            <div class="card">
+                <div class="card-title">System Metrics (Session)</div>
+                <div class="kpi-grid">
+                    <div class="kpi-item">
+                        <div class="kpi-value" id="total_processed">0</div>
+                        <!-- FIX 3: was kpi-Label (capital L) -->
+                        <div class="kpi-label">Total Processed</div>
+                    </div>
+                    <div class="kpi-item">
+                        <div class="kpi-value" style="color: #f59e0b;" id="total_alerts">0</div>
+                        <div class="kpi-label">Alerts Generated</div>
+                    </div>
+                    <div class="kpi-item">
+                        <div class="kpi-value" style="color: #dc2626;" id="urgent_alerts">0</div>
+                        <div class="kpi-label">Urgent (Tier 1)</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Transaction Scorer</div>
+                <label class="input-label">Paste Transaction JSON</label>
+                <textarea id="jsonInput">{
+  "features": {
+    "Payment Format_target_enc": 0.0083,
+    "anomaly_score": 0.88,
+    "burst_score_1h": 3.2,
+    "txns_in_directed_pair": 85,
+    "is_toxic_corridor": 1
+  }
+}</textarea>
+                <div style="display: flex; gap: 8px; margin-top: 10px;">
+                    <button class="btn-predict" id="btnPredict" onclick="predictTransaction()">1. Run Scorer</button>
+                    <button class="btn-investigate" id="btnInvestigate" onclick="investigateTransaction()">2. Generate AI Report</button>
+                </div>
+                <div id="predictionResult" class="result-box"></div>
+            </div>
+        </div>
+
+        <!-- RIGHT: Main Content -->
+        <div class="content">
+            <div class="queue-card">
+                <div class="queue-header">
+                    <span>Case Queue (Simulated)</span>
+                    <span id="queue_count" style="font-weight:bold;">(0 pending)</span>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Case ID</th>
+                            <th>Tier</th>
+                            <th>Probability</th>
+                            <th>Status</th>
+                            <th>Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="queue_tbody"></tbody>
+                </table>
+            </div>
+
+            <div class="ai-card" id="aiCard">
+                <div class="ai-title"> AI Investigative Summary</div>
+                <p id="llmText" style="line-height: 1.7; margin: 0;"></p>
+                <div class="card-title" style="margin-top: 15px;">Top Driving Factors (SHAP)</div>
+                <ul class="shap-list" id="shapList"></ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://127.0.0.1:8080';
+
+        let sessionStats = { processed: 0, alerts: 0, urgent: 0 };
+        let caseCounter = 1000;
+
+        // FIX 1: addToQueue was called but never defined — caused ReferenceError
+        // that silently aborted the entire predictTransaction() function.
+        function addToQueue(data) {
+            const tbody = document.getElementById('queue_tbody');
+            const caseId = `AML-${++caseCounter}`;
+            const tier = data.alert_tier === 'TIER_1_EMERGENCY' ? 'TIER 1' : 'TIER 2';
+            const tagClass = data.alert_tier === 'TIER_1_EMERGENCY' ? 'tag-urgent' : 'tag-pending';
+            const prob = (data.probability * 100).toFixed(2) + '%';
+            const time = new Date().toLocaleTimeString();
+
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${caseId}</td>
+                <td><span class="tag ${tagClass}">${tier}</span></td>
+                <td>${prob}</td>
+                <td>Pending Review</td>
+                <td>${time}</td>
+            `;
+            tbody.prepend(row);
+        }
+
+        async function predictTransaction() {
+            const jsonInput = document.getElementById('jsonInput').value;
+            const resultBox = document.getElementById('predictionResult');
+            const btnInvestigate = document.getElementById('btnInvestigate');
+            const btnPredict = document.getElementById('btnPredict');
+            const aiCard = document.getElementById('aiCard');
+
+            // Validate JSON before sending
+            try {
+                JSON.parse(jsonInput);
+            } catch (e) {
+                resultBox.className = 'result-box alert-emergency';
+                resultBox.innerHTML = `⚠️ Invalid JSON: ${e.message}`;
+                resultBox.style.display = 'block';
+                return;
+            }
+
+            resultBox.style.display = 'none';
+            aiCard.style.display = 'none';
+            btnInvestigate.style.display = 'none';
+            btnPredict.innerHTML = '<span class="spinner"></span>Scoring...';
+            btnPredict.disabled = true;
+
+            try {
+                const response = await fetch(`${API_BASE}/predict`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: jsonInput
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || `HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                sessionStats.processed++;
+
+                if (data.is_alert) {
+                    sessionStats.alerts++;
+                    if (data.alert_tier === 'TIER_1_EMERGENCY') sessionStats.urgent++;
+
+                    const tagClass = data.alert_tier === 'TIER_1_EMERGENCY' ? 'tag-urgent' : 'tag-pending';
+                    const boxClass = data.alert_tier === 'TIER_1_EMERGENCY' ? 'alert-emergency' : 'alert-investigate';
+                    const tierName = data.alert_tier === 'TIER_1_EMERGENCY' ? '🚨 URGENT' : '⚠️ PENDING';
+
+                    resultBox.className = `result-box ${boxClass}`;
+                    resultBox.innerHTML = `
+                        <span class="tag ${tagClass}">${tierName}</span>
+                        <br><br>
+                        Probability: <strong>${(data.probability * 100).toFixed(2)}%</strong><br>
+                        Tier: <strong>${data.alert_tier}</strong><br>
+                        Threshold Used: <strong>${(data.threshold_used * 100).toFixed(1)}%</strong>
+                    `;
+
+                    btnInvestigate.style.display = 'inline-block';
+                    addToQueue(data); 
+                } else {
+                    resultBox.className = 'result-box alert-dismissed';
+                    resultBox.innerHTML = `
+                        <span class="tag tag-safe">✅ DISMISSED</span>
+                        <br><br>Probability: <strong>${(data.probability * 100).toFixed(2)}%</strong> — Below alert threshold.
+                    `;
+                }
+
+                resultBox.style.display = 'block';
+
+                document.getElementById('total_processed').innerText = sessionStats.processed;
+                document.getElementById('total_alerts').innerText = sessionStats.alerts;
+                document.getElementById('urgent_alerts').innerText = sessionStats.urgent;
+                document.getElementById('queue_count').innerText = `(${sessionStats.alerts} alert${sessionStats.alerts !== 1 ? 's' : ''})`;
+
+            } catch (error) {
+                resultBox.className = 'result-box alert-emergency';
+                resultBox.innerHTML = `
+                    <strong>Error:</strong> ${error.message}<br>
+                    <span style="color: var(--text-muted);">Check that the API is running on port 8080 and CORS is enabled.</span>
+                `;
+                resultBox.style.display = 'block';
+            } finally {
+                btnPredict.innerHTML = 'Run Scorer';
+                btnPredict.disabled = false;
+            }
+        }
+
+        async function investigateTransaction() {
+            const jsonInput = document.getElementById('jsonInput').value;
+            const btnInvestigate = document.getElementById('btnInvestigate');
+            const aiCard = document.getElementById('aiCard');
+
+            btnInvestigate.innerHTML = '<span class="spinner"></span>Generating...';
+            btnInvestigate.disabled = true;
+
+            try {
+                const response = await fetch(`${API_BASE}/investigate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: jsonInput
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    alert('Investigation Blocked: ' + err.detail);
+                    return;
+                }
+
+                const data = await response.json();
+
+                document.getElementById('llmText').innerText = data.llm_summary;
+
+                const shapList = document.getElementById('shapList');
+                shapList.innerHTML = '';
+
+                
+                data.shap_raw.forEach(item => {
+                    const shapVal = item.shap_values !== undefined ? item.shap_values : item.shap_value;
+                    const colorClass = shapVal > 0 ? 'shap-pos' : 'shap-neg';
+                    const direction = shapVal > 0 ? '▲ Fraud signal' : '▼ Legit signal';
+
+                    shapList.innerHTML += `
+                        <li class="shap-item ${colorClass}">
+                            <div class="shap-desc">
+                                <strong>${item.feature}</strong>
+                                <span class="shap-amount"> (Value: ${typeof item.value === 'number' ? item.value.toFixed(4) : item.value})</span>
+                            </div>
+                            <div class="shap-val">SHAP: ${Number(shapVal).toFixed(3)} &nbsp;${direction}</div>
+                        </li>`;
+                });
+
+                aiCard.style.display = 'block';
+                aiCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+            } catch (error) {
+                alert('Failed to get AI summary: ' + error.message);
+            } finally {
+                btnInvestigate.innerHTML = 'Generate AI Report';
+                btnInvestigate.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,6 +1,5 @@
 import os
 from openai import OpenAI
-from groq import Groq
 import logging
 from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ def generate_investigation_summary(translated_shap_context: str) -> str:
     """
     try:
         response = client.chat.completions.create(
-            model="z-ai/glm-4.5-air:free",
+            model="openai/gpt-oss-120b:free",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"Alert Evidence:\n{translated_shap_context}"}

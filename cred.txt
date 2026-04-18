@@ -1,0 +1,10 @@
+https://dagshub.com/virajdeshmukh080818/AML.mlflow
+public key: 69f5852e07bfaaa6a9a13c08803b10ed1d25cd26
+import dagshub
+dagshub.init(repo_owner='virajdeshmukh080818', repo_name='AML', mlflow=True)
+
+import mlflow
+with mlflow.start_run():
+  mlflow.log_param('parameter name', 'value')
+  mlflow.log_metric('metric name', 1)
+

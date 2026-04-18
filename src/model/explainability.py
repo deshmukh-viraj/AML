@@ -55,19 +55,32 @@ class AMLExplainer:
         logger.info(f"Saved XAI artifacts to {save_dir}")
 
     
-    def explain_transactions(self, feature_dict: Dict[str, Any])-> List[Dict[str, float]]:
+    def explain_transaction(self, feature_dict: Dict[str, Any])-> List[Dict[str, float]]:
         """
         generates local SHAP values for a single transaction 
         """
         X_input = np.array([[feature_dict.get(f, 0.0) for f in self.feature_names]], dtype=np.float32)
-        shap_values = self.explainer.shap_values(X_input)[0]
+        shap_values = self.explainer.shap_values(X_input)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1]
+        shap_values = shap_values[0]
 
+        analyst_noice = [
+            'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos',
+            'hour_of_day', 'is_end_of_day_txn', 'is_weekend', 'amount_vs_max_ratio', 
+            'Account_HASHED', 'Entity_ID_HASHED'
+        ]
+
+        valid_indices = [
+            i for i in range(len(self.feature_names)) if self.feature_names[i] not in analyst_noice
+        ]
+        sorted_indices = sorted(valid_indices, key=lambda i: np.abs(shap_values[i]), reverse=True)[:6]
         explanation = [
             {
                 "feature": self.feature_names[i],
                 "value": float(X_input[0][i]),
                 "shap_values": float(shap_values[i])
             }
-            for i in np.argsort(np.abs(shap_values))[::-1][:5]
+            for i in sorted_indices
         ]
         return explanation

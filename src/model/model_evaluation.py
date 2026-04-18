@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 import numpy as np
 import polars as pl
 import mlflow
+import lightgbm as lgb
+import xgboost as xgb
 import mlflow.pyfunc
 import mlflow.xgboost
 import mlflow.lightgbm
@@ -240,7 +242,7 @@ def setup_mlflow(params: dict) -> None:
     tracking_uri = f"https://dagshub.com/{repo_owner}/{repo_name}.mlflow"
  
     mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_tracking_uri("mlruns")
+    #mlflow.set_tracking_uri("mlruns")
     mlflow.set_experiment(params["mlflow"]["experiment_name"])
  
     logger.info(f"MLflow tracking URI: {tracking_uri}")
@@ -311,35 +313,79 @@ def log_to_mlflow(
  
         # model artifact
         model_instance = artifact["model"]
-        model_class = type(model_instance).__name__.lower()
-        model_module = type(model_instance).__module__.lower()
-
-        if "lgbmclassifier" in model_class or "lgbmregressor" in model_class:
-            
-            mlflow.sklearn.log_model(sk_model=model_instance, artifact_path="model")
-            logger.info("Logged LGBMClassifier using sklearn flavor ✓")
-
-        elif "booster" in model_class and "lightgbm" in model_module:
-            
-            mlflow.lightgbm.log_model(lgb_model=model_instance, artifact_path="model")
-            logger.info("Logged native using lightgbm flavor")
-
-        elif "xgboost" in model_module:
-            mlflow.xgboost.log_model(xgb_model=model_instance, artifact_path="model")
-            logger.info("Logged using xgboost flavor")
-
+        if hasattr(model_instance, "named_steps"):
+            actual_model = model_instance.named_steps.get('clf', model_instance)
         else:
-            mlflow.sklearn.log_model(sk_model=model_instance, artifact_path="model")
-            logger.warning(f"Unknown type '{model_class}' — fell back to sklearn flavor")
+            actual_model = model_instance
+        
+        try:
+            if isinstance(actual_model, lgb.LGBMClassifier):
+                mlflow.lightgbm.log_model(lgb_model=actual_model, artifact_path="model")
+                logger.info("Logged LightGBM model")
+            elif isinstance(actual_model, xgb.XGBClassifier):
+                mlflow.xgboost.log_model(xgb_model=actual_model, artifact_path="model")
+                logger.info("Logged Xgboost model")
+            else:
+                mlflow.sklearn.log_model(sk_model=model_instance, artifact_path="model")
+                logger.info(f"Logged {type(actual_model).__name__} via mlflow.sklearn")
+        except Exception as e:
+            logger.error(f"Model logging failed: {e}")
+            raise
 
-        # plots
+        try:
+            model_uri = f"runs:/{run.info.run_id}/model"
+            artifact_uri = mlflow.get_artifact_uri("model")
+            logger.info(f"Model artifact URI: {artifact_uri}")
+        except Exception as e:
+            logger.warning(f"Could not verify artifact URI: {e}")
+        
+        logger.info("Model logging complete")
+
+        # client = mlflow.tracking.MlflowClient()
+        # artifacts = client.list_artifacts(run.info.run_id, path="model")
+        # if not artifacts or not any('MLmodel' in a.path or a.is_dir for a in artifacts):
+        #     logger.error("Model artifact verification failed")
+        #     raise RuntimeError("model not properly logged to artifact")
+        # logger.info(f"Model artifacts verified: {len(artifacts)} items in 'model/' path")
+
         for plot_dir in [reports_dir, shap_dir]:
             if plot_dir.exists():
                 for plot in plot_dir.glob("*.png"):
                     mlflow.log_artifact(str(plot), artifact_path="plots")
+                
+                run_id = run.info.run_id
+                logger.info(f"Mlflow run logged | run_id: {run_id}")
+                
+
+        #model_class = type(model_instance).__name__.lower()
+        #model_module = type(model_instance).__module__.lower()
+
+        # if "lgbmclassifier" in model_class or "lgbmregressor" in model_class:
+            
+        #     mlflow.sklearn.log_model(sk_model=model_instance, artifact_path="model")
+        #     logger.info("Logged LGBMClassifier using sklearn flavor ✓")
+
+        # elif "booster" in model_class and "lightgbm" in model_module:
+            
+        #     mlflow.lightgbm.log_model(lgb_model=model_instance, artifact_path="model")
+        #     logger.info("Logged native using lightgbm flavor")
+
+        # elif "xgboost" in model_module:
+        #     mlflow.xgboost.log_model(xgb_model=model_instance, artifact_path="model")
+        #     logger.info("Logged using xgboost flavor")
+
+        # else:
+        #     mlflow.sklearn.log_model(sk_model=model_instance, artifact_path="model")
+        #     logger.warning(f"Unknown type '{model_class}' — fell back to sklearn flavor")
+
+        # # plots
+        # for plot_dir in [reports_dir, shap_dir]:
+        #     if plot_dir.exists():
+        #         for plot in plot_dir.glob("*.png"):
+        #             mlflow.log_artifact(str(plot), artifact_path="plots")
  
-        run_id = run.info.run_id
-        logger.info(f"MLflow run logged | run_id: {run_id}")
+        # run_id = run.info.run_id
+        # logger.info(f"MLflow run logged | run_id: {run_id}")
  
     return run_id
  
@@ -408,6 +454,7 @@ def main():
     
         explainer = AMLExplainer(model=artifact['model'], feature_names=features)
         explainer.get_global_importance(X_test[:1000], save_dir=str(shap_dir))
+        save_dir=str(shap_dir)
 
         del X_test
         gc.collect()

@@ -1,0 +1,326 @@
+schema: '2.0'
+stages:
+  data_ingestion:
+    cmd: python src/data/data_ingestion.py
+    deps:
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: src/connections/s3_connection.py
+      hash: md5
+      md5: fae1bed7be6ffc7b5945bb27c9817b31
+      size: 2311
+    - path: src/data/data_ingestion.py
+      hash: md5
+      md5: 17d5f1e066f631e6869f07832d43f0fe
+      size: 4157
+    params:
+      params.yaml:
+        data_ingestion:
+          trans_local_path: dvc_data/raw/HI-Medium_Trans.parquet
+          acc_local_path: dvc_data/raw/HI-Medium_accounts.parquet
+          s3_bucket: your-aml-bucket-name
+          region_name: us-east-1
+          transactions_s3_key: raw/HI-Medium_Trans.csv
+          accounts_s3_key: raw/HI-Medium_accounts.csv
+    outs:
+    - path: dvc_data/raw/accounts_raw.parquet
+      hash: md5
+      md5: 7f96ad12f649a0d7b3b29a2ade62ba9f
+      size: 61148172
+    - path: dvc_data/raw/transactions_raw.parquet
+      hash: md5
+      md5: 99e225fcd1083c4f127c738433cfa7fb
+      size: 768042761
+  data_preprocessing:
+    cmd: python src/data/data_preprocessing.py
+    deps:
+    - path: dvc_data/raw/accounts_raw.parquet
+      hash: md5
+      md5: 7f96ad12f649a0d7b3b29a2ade62ba9f
+      size: 61148172
+    - path: dvc_data/raw/transactions_raw.parquet
+      hash: md5
+      md5: 99e225fcd1083c4f127c738433cfa7fb
+      size: 768042761
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: src/data/data_preprocessing.py
+      hash: md5
+      md5: d6c0a95bbb01c2bea1ca18a78bead5b7
+      size: 6530
+    params:
+      params.yaml:
+        data_preprocessing:
+          dtype_map:
+          From Bank: str
+          To Bank: str
+          Amount Paid: float32
+          Amount Received: float32
+          Is Laundering: int32
+    outs:
+    - path: dvc_data/processed/accounts_processed.parquet
+      hash: md5
+      md5: 8c559fcca0ca1eea79f7de174bf1a775
+      size: 61351528
+    - path: dvc_data/processed/transactions_processed.parquet
+      hash: md5
+      md5: 819fa01996dfec81bb33638643da2a9a
+      size: 882973932
+  feature_engineering:
+    cmd: python src/features/feature_engineering.py
+    deps:
+    - path: dvc_data/processed/accounts_processed.parquet
+      hash: md5
+      md5: 8c559fcca0ca1eea79f7de174bf1a775
+      size: 61351528
+    - path: dvc_data/processed/transactions_processed.parquet
+      hash: md5
+      md5: 819fa01996dfec81bb33638643da2a9a
+      size: 882973932
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: src/features/build_features.py
+      hash: md5
+      md5: 55fb06de6e868aed3c4e73d113810b1e
+      size: 20565
+    - path: src/features/experimental/advanced_rolling_features_v2.py
+      hash: md5
+      md5: cab4f6e7322a4697f6e050e595c25ef3
+      size: 10222
+    - path: src/features/experimental/base_features.py
+      hash: md5
+      md5: 809b9d7e1558bc63015a1d6b4e52eac8
+      size: 4112
+    - path: src/features/experimental/counterparty_entropy_features_v2.py
+      hash: md5
+      md5: 91964d398ac7426a14cf724e2672a1aa
+      size: 10211
+    - path: src/features/experimental/derived_features.py
+      hash: md5
+      md5: c369e22f1a96255cb850295ef29edf55
+      size: 1364
+    - path: src/features/experimental/network_features.py
+      hash: md5
+      md5: 933e8566f21565ab2ff0004ac5e6995e
+      size: 6313
+    - path: src/features/experimental/precompute_entity_stats.py
+      hash: md5
+      md5: a5a91d2372f6140b3a71083d5de4f321
+      size: 1032
+    - path: src/features/experimental/ratio_features.py
+      hash: md5
+      md5: afbe0a2a2ff0a5038a5669dec48c3bda
+      size: 2605
+    - path: src/features/experimental/rolling_features_v2.py
+      hash: md5
+      md5: 35a2bd67cbc96b8953b99e16296d22e2
+      size: 3382
+    - path: src/features/experimental/toxic_corridors.py
+      hash: md5
+      md5: d6a199b5160b90e2c95f473cb2485f37
+      size: 4074
+    - path: src/features/feature_engineering.py
+      hash: md5
+      md5: faada6d5114ff9d35ffc1f3e1af9a827
+      size: 3885
+    params:
+      params.yaml:
+        feature_engineering:
+          train_days_end: 11
+          val_days_start: 12
+          val_days_end: 13
+          test_days_start: 14
+          test_days_end: 16
+          toxic_corridor_threshold: 0.02
+          toxic_corridor_min_txns: 100
+    outs:
+    - path: dvc_data/aml_features/test_features.parquet
+      hash: md5
+      md5: 10b1eb19a01730a21ccbc0d300f22cf9
+      size: 417793530
+    - path: dvc_data/aml_features/train_features.parquet
+      hash: md5
+      md5: 3e591f56b76a719f327fb63dfbaaaefa
+      size: 1114003492
+    - path: dvc_data/aml_features/val_features.parquet
+      hash: md5
+      md5: 20e821a6b10c13dba14ce7dcc6c94b9b
+      size: 246143852
+  anomaly_scoring:
+    cmd: python src/features/anomaly_feature_scoring.py
+    deps:
+    - path: dvc_data/aml_features/test_features.parquet
+      hash: md5
+      md5: 10b1eb19a01730a21ccbc0d300f22cf9
+      size: 417793530
+    - path: dvc_data/aml_features/train_features.parquet
+      hash: md5
+      md5: 3e591f56b76a719f327fb63dfbaaaefa
+      size: 1114003492
+    - path: dvc_data/aml_features/val_features.parquet
+      hash: md5
+      md5: 20e821a6b10c13dba14ce7dcc6c94b9b
+      size: 246143852
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: src/features/anomaly_feature_scoring.py
+      hash: md5
+      md5: dd39c1475a7d621b1bab20bd92203c84
+      size: 8877
+    params:
+      params.yaml:
+        anomaly:
+          train_sample_size: 2500000
+          chunk_size: 100000
+          contamination: auto
+          random_state: 42
+    outs:
+    - path: dvc_data/processed_with_anomaly/test_features.parquet
+      hash: md5
+      md5: a15ab531ea1cafeab793606951a2a73b
+      size: 672908741
+    - path: dvc_data/processed_with_anomaly/train_features.parquet
+      hash: md5
+      md5: 0eb136dedd3cdfb2184322c5c4244f4d
+      size: 1792373453
+    - path: dvc_data/processed_with_anomaly/val_features.parquet
+      hash: md5
+      md5: 583746fb2023ff90977517cd8fb753fa
+      size: 394878837
+    - path: models/anomaly/isolation_forest.pkl
+      hash: md5
+      md5: 84d577b4d299274b88ed35087f6fee37
+      size: 14128663
+  model_building:
+    cmd: python src/model/model_building.py
+    deps:
+    - path: dvc_data/processed_with_anomaly/test_features.parquet
+      hash: md5
+      md5: a15ab531ea1cafeab793606951a2a73b
+      size: 672908741
+    - path: dvc_data/processed_with_anomaly/train_features.parquet
+      hash: md5
+      md5: 0eb136dedd3cdfb2184322c5c4244f4d
+      size: 1792373453
+    - path: dvc_data/processed_with_anomaly/val_features.parquet
+      hash: md5
+      md5: 583746fb2023ff90977517cd8fb753fa
+      size: 394878837
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: src/model/model_building.py
+      hash: md5
+      md5: efe22fb677d37ead022003c4ac54acb2
+      size: 27467
+    params:
+      params.yaml:
+        model:
+          random_state: 42
+          train_sample_size: 1500000
+          val_sample_size: 500000
+          test_sample_size: 750000
+          fpr_threshold: 0.01
+          mccv_iterations: 5
+          variance_threshold: 0.001
+          shap_threshold: 0.001
+    outs:
+    - path: models/trained_model/
+      hash: md5
+      md5: 4d41353423359211ba733be412e55575.dir
+      size: 10830420
+      nfiles: 7
+    - path: reports/model_metrics.json
+      hash: md5
+      md5: 9ddc7c5d366fced8f8a034fa3d5c420f
+      size: 592
+  model_evaluation:
+    cmd: python src/model/model_evaluation.py
+    deps:
+    - path: dvc_data/processed_with_anomaly/test_features.parquet
+      hash: md5
+      md5: a15ab531ea1cafeab793606951a2a73b
+      size: 672908741
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: src/model/model_evaluation.py
+      hash: md5
+      md5: 844b19b985b94c9f8a417a797e0ef638
+      size: 18873
+    params:
+      params.yaml:
+        dagshub:
+          repo_owner: virajdeshmukh080818
+          repo_name: AML
+        mlflow:
+          experiment_name: AML pipeline
+        model:
+          random_state: 42
+          train_sample_size: 1500000
+          val_sample_size: 500000
+          test_sample_size: 750000
+          fpr_threshold: 0.01
+          mccv_iterations: 5
+          variance_threshold: 0.001
+          shap_threshold: 0.001
+    outs:
+    - path: reports/confusion_matrix.png
+      hash: md5
+      md5: 4b8a925e57a4e5b32ccf0409dd88684a
+      size: 39693
+    - path: reports/eval_metrics.json
+      hash: md5
+      md5: b5b8fda82139334a0480904843d08768
+      size: 426
+    - path: reports/experiment_info.json
+      hash: md5
+      md5: 0ac3658d6ff5a626dd1fc27a99b7a135
+      size: 372
+    - path: reports/pr_curve.png
+      hash: md5
+      md5: d6cb71741617bb4fbce49093dfa431d4
+      size: 48852
+  model_registry:
+    cmd: python src/model/model_registry.py
+    deps:
+    - path: params.yaml
+      hash: md5
+      md5: e9c516d8a507bcf5a10801ca37ae0ec7
+      size: 1569
+    - path: reports/experiment_info.json
+      hash: md5
+      md5: 0ac3658d6ff5a626dd1fc27a99b7a135
+      size: 372
+    - path: reports/model_metrics.json
+      hash: md5
+      md5: 9ddc7c5d366fced8f8a034fa3d5c420f
+      size: 592
+    - path: src/model/model_registry.py
+      hash: md5
+      md5: 1754d2b17274e59fdfd695da2ab62b76
+      size: 10958
+    params:
+      params.yaml:
+        dagshub:
+          repo_owner: virajdeshmukh080818
+          repo_name: AML
+        model_registry:
+          reg_model_name: AML_Laundering_Detector
+          dataset_name: IBM_HI_Medium
+          min_improvement: 0.005
+    outs:
+    - path: reports/registry_output.json
+      hash: md5
+      md5: ae93725378ad1cf827ece90c9a370d4b
+      size: 305

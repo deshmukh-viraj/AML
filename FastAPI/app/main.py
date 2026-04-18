@@ -1,6 +1,4 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+import decimal
 import mlflow
 import mlflow.tracking
 import numpy as np
@@ -8,9 +6,15 @@ import logging
 import pickle
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_fastapi_instrumentator import Instrumentator
+import time
+from typing import List, Optional, Dict, Any
 
-# Import our custom modules
+#import our custom modules
 from explainability import AMLExplainer
 from shap_translator import translate_shap_for_llm
 from llm_service import generate_investigation_summary
@@ -19,6 +23,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AML Triage API", version="1.0")
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+PREDICTION_COUNT = Counter(
+    "aml_prediction_total", "Total predictions made by the scorer",
+    ["decision"]
+)
+
+ALERT_PROBABILITY = Counter(
+    "aml_alert_probability_bucket",
+    "Count of alerts above 80% probability",
+    ["tier"]
+)
 
 #global variables to hold loaded model artifacts
 model_artifacts = None
@@ -33,6 +50,7 @@ class PredictionResponse(BaseModel):
     is_alert: bool
     alert_tier: Optional[str]=None
     threshold_used: float
+    emergency_threshold: float
 
 class InvestigationResponse(BaseModel):
     shap_raw: List[Dict[str, Any]]
@@ -79,6 +97,12 @@ def load_model_and_explainer():
     explainer = AMLExplainer(model=model_artifacts['model'], feature_names=feature_names)
     logger.info("Model and SHAP Explainer loaded successfully.")
 
+@app.get("/")
+async def serve_frontend():
+    html_path = Path("E:\\AML\\FastAPI\\templates\\index.html")
+    with open(html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
+
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "model_loaded": model_artifacts is not None}
@@ -110,6 +134,15 @@ def predict(transaction: TransactionData):
         tier = None
         is_alert = False
 
+    if not is_alert:
+        PREDICTION_COUNT.labels(decision="dismissed").inc()
+    else:
+        if tier == "TIER_1_EMERGENCY":
+            PREDICTION_COUNT.labels(decision="tier_1_emergency").inc()
+        else:
+            PREDICTION_COUNT.labels(decision="tier_2_investigate").inc()
+
+        
     return {
         "probability": float(prob),
         "is_alert": is_alert,
