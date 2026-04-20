@@ -1,4 +1,3 @@
-from sys import exception
 import yaml
 import os
 import logging

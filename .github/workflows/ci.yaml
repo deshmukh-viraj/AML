@@ -24,7 +24,7 @@ jobs:
       - name: Install DVC
         run: pip install dvc
 
-      - name: Pull Data from DagsHub (Run Pipeline)
+      - name: Run Pipeline
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
         run: |
