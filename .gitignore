@@ -101,3 +101,4 @@ mlruns/
 cred.txt/
 test.ipynb
 dvc_data/
+.dvc/cache/
