@@ -111,8 +111,8 @@ def load_data_from_gdrive(params: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
     else:
         accounts = pl.read_csv(acc_path)
 
-    logger.info(f"Transactions loaded: {len(transactions):, }")
-    logger.info(f"Accounts loaded: {len(accounts):, }")
+    logger.info(f"Transactions loaded: {len(transactions):,}")
+    logger.info(f"Accounts loaded: {len(accounts):,}")
 
     return transactions, accounts
 
