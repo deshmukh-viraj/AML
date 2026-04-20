@@ -15,7 +15,7 @@ import time
 from typing import List, Optional, Dict, Any
 
 #import our custom modules
-from explainability import AMLExplainer
+from src.model.explainability import AMLExplainer
 from shap_translator import translate_shap_for_llm
 from llm_service import generate_investigation_summary
 
@@ -107,6 +107,13 @@ async def serve_frontend():
 def health_check():
     return {"status": "healthy", "model_loaded": model_artifacts is not None}
 
+@app.get("/features")
+def get_required_features():
+    if not feature_names:
+        raise HTTPException(status_code=503, detail="model not loaded yet")
+    return {"features": feature_names}
+
+    
 @app.post("/predict", response_model=PredictionResponse)
 def predict(transaction: TransactionData):
     """
@@ -114,8 +121,21 @@ def predict(transaction: TransactionData):
     """
     if not model_artifacts: raise HTTPException(status_code=503, detail="Model not loaded")
 
+    #checked all requreid features are present
+    missing_feat = [f for f in feature_names if f not in transaction.features]
+    if missing_feat:
+        raise  HTTPException(status_code=422, detail=f"Missing required features: {missing_feat}")
+
+    #check all values are valid
+    invalid_feat = {
+        f: transaction.features[f] for f in feature_names if transaction.features[f] is None
+        or not np.isfinite(transaction.features[f])
+    }
+    if invalid_feat:
+        raise HTTPException(status_code=422, detail=f"Invalid feature values : {invalid_feat}")
+
     # Format input
-    X_input = np.array([[transaction.features.get(f, 0.0) for f in feature_names]], dtype=np.float32)
+    X_input = np.array([[transaction.features[f] for f in feature_names]], dtype=np.float32)
 
     raw_prob = model_artifacts["model"].predict_proba(X_input)[0][1]
     prob =model_artifacts['platt'].predict_proba([[raw_prob]])[0][1]

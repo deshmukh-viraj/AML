@@ -100,3 +100,4 @@ models/
 reports/
 mlruns/
 cred.txt/
+test.ipynb

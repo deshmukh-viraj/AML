@@ -24,7 +24,7 @@ jobs:
       - name: Install DVC
         run: pip install dvc
 
-      - name: Pull Data from DagsHub
+      - name: Pull Data from DagsHub (Run Pipeline)
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
         run: |
@@ -33,11 +33,28 @@ jobs:
           dvc remote modify myremote user virajdeshmukh080818
           dvc remote modify myremote password $DAGSHUB_TOKEN
           # Download the actual .pkl files into the GitHub runner
-          dvc pull
+          dvc repro
         
 
-      - name: Run API Tests
-        run: pytest tests/ -v 
+      - name: Run Model Tests
+        env:
+          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+        run: pytest -m pytest tests/test_model.py
+
+      
+      - name: Promote Model to Production
+        if: success()
+        env:
+          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME}}
+        run:
+          python scripts/promote_model.py
+
+        
+      - name: Run FastAPI App tests
+        if: success()
+        run: pytest tests/test_app.py
+
 
       # ================= DEPLOYMENT STEPS =================
       # - name: Configure AWS Credentials
