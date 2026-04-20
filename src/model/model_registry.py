@@ -1,6 +1,7 @@
 import os
 import json
 import pickle
+from re import M
 import yaml
 import logging
 from pathlib import Path
@@ -163,6 +164,21 @@ def register_model(
     returns registered model version number.
     """
     logger.info(f"Registering model '{registered_model_name}'...")
+    
+    model_build_dir = Path(params["storage"]["model_build_dir"])
+    pkl_files = list(model_build_dir.glob("*.pkl"))
+    if not pkl_files:
+        raise FileNotFoundError(f"No. pkl found in {model_build_dir}")
+    
+    model_path = pkl_files[0]
+    logging.info(f"Logging model from {model_path}")
+
+    with open(model_path, "rb") as x:
+        model = pickle.load(x)
+    
+    with mlflow.start_run(run_id=run_id):
+        mlflow.sklearn.log_model(model, "model")
+    logger.info("Model artifact logged")
     
     model_uri = f"runs:/{run_id}/model"
     try:

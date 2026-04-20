@@ -60,8 +60,8 @@ class TestAMLModelLoading(unittest.TestCase):
     @staticmethod
     def get_latest_model_version(model_name, stage="None"):
         client = mlflow.MlflowClient()
-        latest_version = client.get_latest_versions(model_name, stages=[stage])
-        return latest_version[0].version if latest_version else None
+        latest_version = client.get_model_version_by_alias(model_name, "staging")
+        return latest_version.version if latest_version else None
 
     def test_model_load(self):
         self.assertIsNone(self.new_model)
