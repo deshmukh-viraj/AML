@@ -1,6 +1,5 @@
 import gc
 import os
-from sys import exception
 import yaml
 import logging
 import json
