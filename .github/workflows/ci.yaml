@@ -39,7 +39,7 @@ jobs:
       - name: Run Model Tests
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-        run: pytest -m pytest tests/test_model.py
+        run: pytest tests/test_model.py
 
       
       - name: Promote Model to Production
