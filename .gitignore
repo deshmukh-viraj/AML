@@ -100,5 +100,4 @@ reports/
 mlruns/
 cred.txt/
 test.ipynb
-dvc_data/processed/
-dvc_data/processed_with_anomaly
+dvc_data/

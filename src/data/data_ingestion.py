@@ -1,5 +1,6 @@
 import yaml
 import os
+import gdown
 import logging
 import polars as pl
 from src.logger import logging
@@ -82,6 +83,39 @@ def load_data_from_s3(params: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
 
     return transactions, accounts
 
+def load_data_from_gdrive(params: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """ download data from google drive"""
+
+    cfg = params['data_ingestion']
+    raw_dir = Path(params['storage']['raw_data_dir'])
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    trans_file_id = cfg['gdrive_trans_id']
+    acc_file_id = cfg['gdrive_acc_id']
+
+    trans_path = raw_dir / "transactions_data"
+    acc_path = raw_dir / "accounts_data"
+
+    logger.info("Downloading data from google drive...")
+    gdown.download(f"https://drive.google.com/uc?id={trans_file_id}", str(trans_path), quiet=False)
+    gdown.download(f"https://drive.google.com/uc?id={acc_file_id}", str(acc_path), quiet=False)
+
+    #load using polars
+    if trans_path.suffix == 'parquet':
+        transactions = pl.read_parquet(trans_path)
+    else:
+        transactions = pl.read_csv(trans_path)
+
+    if acc_path.suffix == 'parquet':
+        accounts = pl.read_parquet(acc_path)
+    else:
+        accounts = pl.read_csv(acc_path)
+
+    logger.info(f"Transactions loaded: {len(transactions):, }")
+    logger.info(f"Accounts loaded: {len(accounts):, }")
+
+    return transactions, accounts
+
 
 def save_raw_data(transactions: pl.DataFrame, accounts: pl.DataFrame, params: dict) -> tuple[Path, Path]:
     """
@@ -110,9 +144,10 @@ def main():
     try:
         params = load_params('params.yaml')
         #local data loading
-        transactions, accounts = load_data_local(params)
+        #transactions, accounts = load_data_local(params)
         #s3 data loading
         #transactions, accounts = load_data_from_s3(params)
+        transactions, accounts = load_data_from_gdrive(params)
         trans_path, acc_path = save_raw_data(transactions, accounts, params)
 
         logger.info('=' * 60)

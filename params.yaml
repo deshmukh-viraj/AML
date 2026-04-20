@@ -8,6 +8,9 @@ data_ingestion:
   transactions_s3_key: "raw/HI-Medium_Trans.csv"
   accounts_s3_key: "raw/HI-Medium_accounts.csv"
 
+  # google drive cred
+  gdrive_trans_id: "1Jh9kxlK69r37i-a_K1AK_tPccgYjKmcy"
+  gdrive_acc_id: "1NNJcs0nWbZKUESNfw1FX-AX5nfBiRb0j" 
 
 data_preprocessing:
   dtype_map:
