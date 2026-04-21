@@ -34,6 +34,7 @@ jobs:
       - name: Configure DVC credentials
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_TOKEN }}
         run: |
           dvc remote modify myremote auth basic
           dvc remote modify myremote user virajdeshmukh080818
@@ -46,6 +47,7 @@ jobs:
       - name: Run Pipeline
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME}}
         run: |
           # Configure DVC remote to use basic auth with your token
           dvc remote modify myremote auth basic
