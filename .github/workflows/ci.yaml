@@ -25,22 +25,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies
-        run: | 
-          pip install -r requirements.txt
-          pip install -r requirements-test.txt
-     
 
-      - name: Configure DVC credentials
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: |
-          dvc remote modify myremote auth basic
-          dvc remote modify myremote user virajdeshmukh080818
-          dvc remote modify myremote password $DAGSHUB_TOKEN
-      
-      - name: Cache DVC cache
+      - name: Cache DVC outputs
         uses: actions/cache@v4
         with:
           path: .dvc/cache
@@ -49,8 +35,21 @@ jobs:
             ${{ runner.os }}-dvc-
 
 
-      - name: Pull DVC data
-        run: dvc pull
+      - name: Install dependencies
+        run: | 
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+     
+
+      - name: Configure DVC and Pull data
+        env:
+          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+        run: |
+          dvc remote modify myremote auth basic
+          dvc remote modify myremote user virajdeshmukh080818
+          dvc remote modify myremote password $DAGSHUB_TOKEN
+          dvc pull
 
 
       - name: Run Pipeline
@@ -58,18 +57,28 @@ jobs:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
         run: |
-          # Configure DVC remote to use basic auth with your token
-          dvc remote modify myremote auth basic
-          dvc remote modify myremote user virajdeshmukh080818
-          dvc remote modify myremote password $DAGSHUB_TOKEN
-          # Download the actual .pkl files into the GitHub runner
           dvc repro
           dvc push
+
+
+      - name: Run Model Evaluation
+        env:
+          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+        run: python src/model/model_evaluation.py
+
+     
+      - name: Run Model Registry
+        env:
+          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+        run: python src/model/model_registry.py
 
 
       - name: Run Model Tests
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
         run: python -m pytest tests/test_model.py
 
       

@@ -89,38 +89,38 @@ stages:
           cache: false
 
   #stage 5 - model evaluation
-  model_evaluation:
-    cmd: python src/model/model_evaluation.py
-    deps:
-      - src/model/model_evaluation.py
-      - dvc_data/processed_with_anomaly/test_features.parquet
-      - params.yaml
-    params:
-      - model
-      - dagshub
-      - mlflow
-    outs:
-      - reports/experiment_info.json:
-          cache: false
-      - reports/confusion_matrix.png:
-          cache: false
-      - reports/pr_curve.png:
-          cache: false
-    metrics:
-      - reports/eval_metrics.json:
-          cache: false
+  # model_evaluation:
+  #   cmd: python src/model/model_evaluation.py
+  #   deps:
+  #     - src/model/model_evaluation.py
+  #     - dvc_data/processed_with_anomaly/test_features.parquet
+  #     - params.yaml
+  #   params:
+  #     - model
+  #     - dagshub
+  #     - mlflow
+  #   outs:
+  #     - reports/experiment_info.json:
+  #         cache: false
+  #     - reports/confusion_matrix.png:
+  #         cache: false
+  #     - reports/pr_curve.png:
+  #         cache: false
+  #   metrics:
+  #     - reports/eval_metrics.json:
+  #         cache: false
 
   #stage 6 - model registry
-  model_registry:
-    cmd: python src/model/model_registry.py
-    deps:
-      - src/model/model_registry.py
-      - reports/experiment_info.json
-      - reports/model_metrics.json
-      - params.yaml
-    params:
-      - model_registry
-      - dagshub
-    outs:
-      - reports/registry_output.json:
-          cache: false
+  # model_registry:
+  #   cmd: python src/model/model_registry.py
+  #   deps:
+  #     - src/model/model_registry.py
+  #     - reports/experiment_info.json
+  #     - reports/model_metrics.json
+  #     - params.yaml
+  #   params:
+  #     - model_registry
+  #     - dagshub
+  #   outs:
+  #     - reports/registry_output.json:
+  #         cache: false

@@ -180,7 +180,7 @@ def register_model(
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = os.path.join(tmpdir, "model.pkl")
             with open(model_path, "wb") as f:
-                pickle.dump(model['model'], f)
+                pickle.dump(model, f)
             mlflow.log_artifact(model_path, artifact_path="model")
     
     logger.info("Model artifact uploaded to Dagshub")

@@ -16,8 +16,8 @@ from typing import List, Optional, Dict, Any
 
 #import our custom modules
 from src.model.explainability import AMLExplainer
-from shap_translator import translate_shap_for_llm
-from llm_service import generate_investigation_summary
+from .shap_translator import translate_shap_for_llm
+from .llm_service import generate_investigation_summary
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,27 +64,27 @@ def load_model_and_explainer():
     """
     global explainer, feature_names, model_artifacts
     
-    # dagshub_token = os.getenv("DAGSHUB_TOKEN")
-    # dagshub_username = os.getenv("DAGSHUB_USERNAME")
-    # if not dagshub_token or not dagshub_username:
-    #     raise ValueError("DAGSHUB_TOKEN OR DAGSHUB_USERNAME not set in .evn")
+    dagshub_token = os.getenv("DAGSHUB_TOKEN")
+    dagshub_username = os.getenv("DAGSHUB_USERNAME")
+    if not dagshub_token or not dagshub_username:
+        raise ValueError("DAGSHUB_TOKEN OR DAGSHUB_USERNAME not set in .evn")
     
-    # os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_username
-    # os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
-    # # Set MLflow tracking URI to Dagshub
-    # os.environ["MLFLOW_TRACKING_URI"] = "https://dagshub.com/virajdeshmukh080818/AML.mlflow"
-    # mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+    os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_username
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
+    # Set MLflow tracking URI to Dagshub
+    os.environ["MLFLOW_TRACKING_URI"] = "https://dagshub.com/virajdeshmukh080818/AML.mlflow"
+    mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
     
-    # #get run id from staging model
-    # client = mlflow.tracking.MlflowClient(os.environ["MLFLOW_TRACKING_URI"])
-    # mv = client.get_model_version_by_alias("AML_Laundering_Detector", "staging")
-    # run_id = mv.run_id
+    #get run id from staging model
+    client = mlflow.tracking.MlflowClient(os.environ["MLFLOW_TRACKING_URI"])
+    mv = client.get_model_version_by_alias("AML_Laundering_Detector", "staging")
+    run_id = mv.run_id
 
-    # # download artifacts
-    # artifact_uri = f"runs:/{run_id}/model"
-    # local_path = mlflow.artifacts.download_artifacts(artifact_uri)
-    # pkl_file = list(Path(local_path).glob('*.pkl'))[0]
-    pkl_file = Path(r"E:\AML\models\trained_model\LightGBM.pkl")
+    # download artifacts
+    artifact_uri = f"runs:/{run_id}/model"
+    local_path = mlflow.artifacts.download_artifacts(artifact_uri)
+    pkl_file = list(Path(local_path).glob('*.pkl'))[0]
+    #pkl_file = Path(r"E:\AML\models\trained_model\LightGBM.pkl")
 
     if not pkl_file.exists():
         raise FileNotFoundError("model not found")

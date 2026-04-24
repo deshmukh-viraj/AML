@@ -68,8 +68,9 @@ class TestAMLModelLoading(unittest.TestCase):
             'From Bank_freq_enc', 'To Bank_freq_enc', 'corridor_freq_enc', 'anomaly_score'
         ]
         
-        cls.holdout_data = pl.read_csv('data/test/test_data.csv')
-
+        cls.holdout_data = pl.read_csv(
+                    'data/test/test_data_sample.csv', columns=cls.feature_names + ['Is Laundering']
+        )
         try:
             client = mlflow.MlflowClient()
             prod_version = client.get_model_version_by_alias(cls.model_name, "production")
