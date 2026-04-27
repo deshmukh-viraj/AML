@@ -51,6 +51,7 @@ class TestAMLModelLoading(unittest.TestCase):
         cls.model = artifacts["model"]
         cls.platt = artifacts["platt"]
         cls.feature_names = artifacts["features"]
+        cls.threshold = artifacts['optimal_threshold']
 
         logger.info(f"Model loaded: {type(cls.model)}")
 
