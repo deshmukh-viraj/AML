@@ -43,6 +43,7 @@ jobs:
      
 
       - name: Run Pipeline
+        if: contains(github.event.head_commit.message, 'train') || contains(github.event.head_commit.message, 'data')
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
@@ -54,10 +55,7 @@ jobs:
           dvc repro
           dvc push
 
-      - name: Run Pipeline
-        if: contains(github.event.head_commit.message, 'train') || contains(github.event.head_commit.message, 'data')
-
-        
+    
       - name: Run Model Evaluation
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
