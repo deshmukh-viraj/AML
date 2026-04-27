@@ -5,8 +5,7 @@ on:
     branches: [ "master" ]
 
 jobs:
-  # ── Job 1: Expensive pipeline — only reruns if code/data actually changes ──
-  run-pipeline:
+  test-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,20 +25,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+
       - name: Cache DVC outputs
         uses: actions/cache@v4
         with:
           path: |
-            .dvc/cache
-            dvc_data/
+             .dvc/cache
           key: ${{ runner.os }}-dvc-${{ hashFiles('dvc.lock') }}
           restore-keys: |
             ${{ runner.os }}-dvc-
 
+
       - name: Install dependencies
-        run: |
+        run: | 
           pip install -r requirements.txt
           pip install -r requirements-test.txt
+     
 
       - name: Run Pipeline
         env:
@@ -53,65 +54,20 @@ jobs:
           dvc repro
           dvc push
 
-
-  # ── Job 2: Reruns from here on ANY failure — Job 1 is never touched again ──
-  evaluate-test-deploy:
-    needs: run-pipeline        # waits for job 1 to pass, skips if job 1 fails
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Cache DVC outputs          # restores dvc_data/ populated by job 1
-        uses: actions/cache@v4
-        with:
-          path: |
-            .dvc/cache
-            dvc_data/
-          key: ${{ runner.os }}-dvc-${{ hashFiles('dvc.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-dvc-
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install -r requirements-test.txt
-
-      - name: Configure DVC credentials   # needed for MLflow/DagShub calls + cache miss fallback
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: |
-          dvc remote modify myremote auth basic
-          dvc remote modify myremote user virajdeshmukh080818
-          dvc remote modify myremote password $DAGSHUB_TOKEN
-          dvc pull                         # fast if cache hit, pulls from remote if cache missed
-
+    
       - name: Run Model Evaluation
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
         run: python src/model/model_evaluation.py
 
+     
       - name: Run Model Registry
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
         run: python src/model/model_registry.py
+
 
       - name: Run Model Tests
         env:
@@ -119,18 +75,18 @@ jobs:
           DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
         run: python -m pytest tests/test_model.py
 
+      
       - name: Promote Model to Production
         if: success()
         env:
           DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: python scripts/promote_model.py
+          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME}}
+        run:
+          python scripts/promote_model.py
 
+        
       - name: Run FastAPI App tests
         if: success()
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
         run: python -m pytest tests/test_app.py
 
 
@@ -155,6 +111,8 @@ jobs:
       #     ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       #     IMAGE_TAG: ${{ github.sha }}
       #   run: |
+      #     # By this point, 'dvc pull' has downloaded the pkl file into the runner.
+      #     # Docker build will package it into the image!
       #     docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
       #     docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 

@@ -1,4 +1,4 @@
-import decimal
+from fastapi import FastAPI, HTTPException
 import mlflow
 import mlflow.tracking
 import numpy as np
@@ -14,7 +14,6 @@ from prometheus_fastapi_instrumentator import Instrumentator
 import time
 from typing import List, Optional, Dict, Any
 
-#import our custom modules
 from src.model.explainability import AMLExplainer
 from .shap_translator import translate_shap_for_llm
 from .llm_service import generate_investigation_summary
@@ -191,8 +190,15 @@ def investigate_alert(transaction: TransactionData):
     #get SHAP values
     shap_data = explainer.explain_transaction(transaction.features)
     human_readable_evidence = translate_shap_for_llm(shap_data, transaction.features)
-    narrative = generate_investigation_summary(human_readable_evidence)
-    
+    try:
+        narrative = generate_investigation_summary(human_readable_evidence)
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail='Investigation report temporarily unavailable'
+        )
+        
     return {
         "shap_raw": shap_data,             
         "evidence_list": human_readable_evidence, 
