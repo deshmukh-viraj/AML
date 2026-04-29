@@ -15,8 +15,8 @@ import time
 from typing import List, Optional, Dict, Any
 
 from src.model.explainability import AMLExplainer
-from .shap_translator import translate_shap_for_llm
-from .llm_service import generate_investigation_summary
+from FastAPI.app.shap_translator import translate_shap_for_llm
+from FastAPI.app.llm_service import generate_investigation_summary
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -121,20 +121,22 @@ def predict(transaction: TransactionData):
     if not model_artifacts: raise HTTPException(status_code=503, detail="Model not loaded")
 
     #checked all requreid features are present
-    missing_feat = [f for f in feature_names if f not in transaction.features]
-    if missing_feat:
-        raise  HTTPException(status_code=422, detail=f"Missing required features: {missing_feat}")
+    # missing_feat = [f for f in feature_names if f not in transaction.features]
+    # if missing_feat:
+    #     raise  HTTPException(status_code=422, detail=f"Missing required features: {missing_feat}")
 
-    #check all values are valid
-    invalid_feat = {
-        f: transaction.features[f] for f in feature_names if transaction.features[f] is None
-        or not np.isfinite(transaction.features[f])
-    }
-    if invalid_feat:
-        raise HTTPException(status_code=422, detail=f"Invalid feature values : {invalid_feat}")
+    # #check all values are valid
+    # invalid_feat = {
+    #     f: transaction.features[f] for f in feature_names if transaction.features[f] is None
+    #     or not np.isfinite(transaction.features[f])
+    # }
+    # if invalid_feat:
+    #     raise HTTPException(status_code=422, detail=f"Invalid feature values : {invalid_feat}")
 
     # Format input
-    X_input = np.array([[transaction.features[f] for f in feature_names]], dtype=np.float32)
+    raw_list = [transaction.features.get(f) or np.nan for f in feature_names]
+    X_input = np.array([raw_list], dtype=np.float32)
+    X_input = np.nan_to_num(X_input, nan=np.nan)
 
     raw_prob = model_artifacts["model"].predict_proba(X_input)[0][1]
     prob =model_artifacts['platt'].predict_proba([[raw_prob]])[0][1]
@@ -178,7 +180,10 @@ def investigate_alert(transaction: TransactionData):
     """
     if not explainer: raise HTTPException(status_code=503, detail="Model not loaded yet")
 
-    X_input = np.array([[transaction.features.get(f, 0.0) for f in feature_names]], dtype=np.float32)
+    raw_list = [transaction.features.get(f) or np.nan for f in feature_names]
+    X_input = np.array([raw_list], dtype=np.float32)
+    X_input = np.nan_to_num(X_input, nan=np.nan)
+
     raw_prob = model_artifacts["model"].predict_proba(X_input)[0][1]
     prob = model_artifacts['platt'].predict_proba([[raw_prob]])[0][1]    
 

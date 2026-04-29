@@ -143,13 +143,12 @@
     </div>
 
     <script>
-        const API_BASE = 'http://127.0.0.1:8080';
+        const API_BASE = '';
 
         let sessionStats = { processed: 0, alerts: 0, urgent: 0 };
         let caseCounter = 1000;
 
-        // FIX 1: addToQueue was called but never defined — caused ReferenceError
-        // that silently aborted the entire predictTransaction() function.
+     
         function addToQueue(data) {
             const tbody = document.getElementById('queue_tbody');
             const caseId = `AML-${++caseCounter}`;
@@ -245,7 +244,7 @@
                 resultBox.className = 'result-box alert-emergency';
                 resultBox.innerHTML = `
                     <strong>Error:</strong> ${error.message}<br>
-                    <span style="color: var(--text-muted);">Check that the API is running on port 8080 and CORS is enabled.</span>
+                    <span style="color: var(--text-muted);">Check that the API is running on port 8082 and CORS is enabled.</span>
                 `;
                 resultBox.style.display = 'block';
             } finally {

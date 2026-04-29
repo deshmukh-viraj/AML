@@ -9,8 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+COPY FastAPI/requirements.txt fastapi-requirements.txt
 RUN pip install --upgrade pip && \
-    pip install --prefix=/install --no-cache-dir -r requirements.txt
+    pip install --prefix=/install --no-cache-dir -r requirements.txt && \
+    pip install --prefix=/install --no-cache-dir -r fastapi-requirements.txt
 
 
 FROM python:3.10-slim AS runtime
