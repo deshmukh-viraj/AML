@@ -4,90 +4,95 @@ on:
   push:
     branches: [ "master" ]
 
+permissions:
+  contents: read
+  packages: write
+  
+
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    env:
-      GHCR_USERNAME: deshmukh-viraj
+  # build-and-push:
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     GHCR_USERNAME: deshmukh-viraj
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+  #     - name: Setup Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.10'
 
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-
-      - name: Cache DVC outputs
-        uses: actions/cache@v4
-        with:
-          path: |
-             .dvc/cache
-          key: ${{ runner.os }}-dvc-${{ hashFiles('dvc.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-dvc-
+  #     - name: Cache pip dependencies
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: ~/.cache/pip
+  #         key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-pip-
 
 
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -e .
-          pip install -r requirements.txt
-          pip install -r FastAPI/requirements.txt
-          pip install -r requirements-test.txt
+  #     - name: Cache DVC outputs
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: |
+  #            .dvc/cache
+  #         key: ${{ runner.os }}-dvc-${{ hashFiles('dvc.lock') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-dvc-
+
+
+  #     - name: Install dependencies
+  #       run: |
+  #         pip install --upgrade pip
+  #         pip install -e .
+  #         pip install -r requirements.txt
+  #         pip install -r FastAPI/requirements.txt
+  #         pip install -r requirements-test.txt
      
 
-      - name: Run Pipeline
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: |
-          dvc remote modify myremote auth basic
-          dvc remote modify myremote user virajdeshmukh080818
-          dvc remote modify myremote password $DAGSHUB_TOKEN
-          dvc pull
-          dvc repro
-          dvc push
+  #     - name: Run Pipeline
+  #       env:
+  #         DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+  #         DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+  #       run: |
+  #         dvc remote modify myremote auth basic
+  #         dvc remote modify myremote user virajdeshmukh080818
+  #         dvc remote modify myremote password $DAGSHUB_TOKEN
+  #         dvc pull
+  #         dvc repro
+  #         dvc push
 
     
-      - name: Run Model Evaluation
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: python src/model/model_evaluation.py
+  #     - name: Run Model Evaluation
+  #       env:
+  #         DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+  #         DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+  #       run: python src/model/model_evaluation.py
 
      
-      - name: Run Model Registry
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: python src/model/model_registry.py
+  #     - name: Run Model Registry
+  #       env:
+  #         DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+  #         DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+  #       run: python src/model/model_registry.py
 
 
-      - name: Run Model Tests
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
-        run: python -m pytest tests/test_model.py
+  #     - name: Run Model Tests
+  #       env:
+  #         DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+  #         DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+  #       run: python -m pytest tests/test_model.py
 
       
-      - name: Promote Model to Production
-        if: success()
-        env:
-          DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
-          DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME}}
-        run:
-          python scripts/promote_model.py
+  #     - name: Promote Model to Production
+  #       if: success()
+  #       env:
+  #         DAGSHUB_TOKEN: ${{ secrets.AML_TEST }}
+  #         DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME}}
+  #       run:
+  #         python scripts/promote_model.py
 
         
       # - name: Run FastAPI App tests
