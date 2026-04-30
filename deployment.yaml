@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aml-triage-deployment
+spec:
+  replicas: 1 
+  selector:
+    matchLabels:
+      app: aml-triage
+  template:
+    metadata:
+      labels:
+        app: aml-triage
+    spec:
+      containers:
+      - name: aml-triage-app
+        
+        image: ghcr.io/deshmukh-viraj/aml-triage:latest 
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - secretRef:
+            name: app-secrets
