@@ -104,3 +104,4 @@ mlruns/
 cred.txt/
 test.ipynb
 dvc_data/
+kubectl.exe
